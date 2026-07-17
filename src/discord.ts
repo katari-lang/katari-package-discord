@@ -80,11 +80,10 @@ katari.agent<{ client: string; channel_id: string; deliver_to: KatariAgent }>(
         attachments: Map<string, { url: string; contentType: string | null }>;
       }) => {
         if (message.author.bot || message.channelId !== channel_id) return;
-        // Deliver back into the runtime as an inner delegation; the callback's `on_message`
-        // request escalates through this call to the app's handler. Attachments download from the
-        // CDN and lift into `file` values first (one that fails to download is dropped rather than
-        // failing the whole message). A delivery failure tears the watch down (the app's panic
-        // clause reports it).
+        // Deliver back into the runtime as an inner delegation; the callback's effects escalate
+        // through this call to the app's handlers. Attachments download from the CDN and lift into
+        // `file` values first (one that fails to download is dropped rather than failing the whole
+        // message). A delivery failure tears the watch down (the app's panic clause reports it).
         void (async () => {
           const files: KatariFile[] = [];
           for (const attachment of message.attachments.values()) {
@@ -98,7 +97,7 @@ katari.agent<{ client: string; channel_id: string; deliver_to: KatariAgent }>(
               }),
             );
           }
-          await deliver_to.call({ text: message.content, channel_id: message.channelId, files });
+          await deliver_to.call({ channel_id: message.channelId, text: message.content, files });
         })().catch((error) => {
           cleanup();
           reject(error instanceof Error ? error : new Error(String(error)));

@@ -1,7 +1,6 @@
-// The Discord library: a gateway-client capability plus the watch / send agents. Independent of
-// the AI layer — an app wires the two together by handling `on_message` with whatever logic it
-// likes. The externals are implemented in `discord.ts` (the same module path, so they register
-// under `discord.*`). The one-line integration is the provider:
+// The Discord library: a gateway-client capability plus the watch / send agents, the Discord twin
+// of the Slack package. The externals are implemented in `discord.ts` (the same module path, so they
+// register under `discord.*`). The one-line integration is the provider:
 // `use discord.provider(token = env.get_secret(key = "DISCORD_TOKEN"))`.
 //
 // Files are first-class on both directions: an incoming message's attachments arrive as `file`
@@ -11,19 +10,11 @@
 @"The live Discord gateway connection (the JS client lives in the sidecar; the handle is opaque)."
 request get_discord_client() -> string
 
-@"Raised once per incoming message; the caller installs a handler to react however it likes.
-@files@ are the message's attachments, already lifted into `file` values."
-request on_message(
-  @"The message's text content." text: string,
-  @"The channel the message arrived in." channel_id: string,
-  @"The message's attachments, already lifted into `file` values." files: array[file],
-) -> null
-
 @"Provide the Discord gateway connection for the extent of the continuation: log in once, then serve
 `get_discord_client` to everything downstream."
 agent provider[R, effect E](
   @"The bot token; it stays in the provider, passed straight to the sidecar login." token: string of private,
-  @"The block to run with the connection served to it." continuation: agent (value: null) -> R with {...E, get_discord_client},
+  @"Runs with `get_discord_client` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, get_discord_client},
 ) -> R with E | io {
   use handler (var client = create_discord_client(token = token)) {
     request get_discord_client() { next client }
@@ -45,13 +36,13 @@ external agent discord_send(
   @"Files to attach to the post." files: array[file],
 ) -> null
 
-@"Low-level: listen on a channel and deliver each message (text + attachments as files) to a
-callback. Prefer the watch_messages agent."
-external agent discord_watch(
+@"Low-level: listen on a channel and deliver each incoming message (channel_id / text / attachments
+as files) to a callback. Prefer the watch_messages agent."
+external agent discord_watch[effect E](
   @"The opaque client handle to listen through." client: string,
   @"The channel to listen on." channel_id: string,
-  @"Called once per incoming message." deliver_to: agent (text: string, channel_id: string, files: array[file]) -> null with on_message,
-) -> never with on_message
+  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel_id: string, text: string, files: array[file]) -> null with E,
+) -> never with E
 
 @"Post a message to a channel using the ambient Discord client; @files@ attach to it (pass `[]`
 for a plain text post — parameter defaults only take literals, so the empty array cannot default)."
@@ -73,18 +64,12 @@ agent send_files(
   send_message(channel_id = channel_id, text = caption, files = files)
 }
 
-@"Bridge: turn each delivered message into an on_message request for the caller to handle."
-agent deliver(
-  @"The message's text content." text: string,
-  @"The channel the message arrived in." channel_id: string,
-  @"The message's attachments as `file` values." files: array[file],
-) -> null with on_message {
-  on_message(text = text, channel_id = channel_id, files = files)
-}
-
-@"Serve a channel forever, raising on_message for each message. Just provide the channel + a handler."
-agent watch_messages(
+@"Serve a channel forever, delivering each incoming message to @deliver_to@ — shaped like
+`time.watch` / `google_calendar.watch` so it composes under `parallel [ … ]`. Bot posts (this bot's
+own replies included) are not delivered, so replying from @deliver_to@ cannot loop."
+agent watch_messages[effect E](
   @"The channel to serve." channel_id: string,
-) -> never {
-  discord_watch(client = get_discord_client(), channel_id = channel_id, deliver_to = deliver)
+  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel_id: string, text: string, files: array[file]) -> null with E,
+) -> never with E | get_discord_client | io {
+  discord_watch(client = get_discord_client(), channel_id = channel_id, deliver_to = deliver_to)
 }

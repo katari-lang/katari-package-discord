@@ -4,8 +4,15 @@
   "private": true,
   "type": "module",
   "description": "FFI sidecar dependencies for the Katari `discord` package (src/discord.ts).",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
   "dependencies": {
     "@katari-lang/port": "0.1.0-rc8",
     "discord.js": "^14.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "typescript": "^5.9.0"
   }
 }
