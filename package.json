@@ -1,0 +1,11 @@
+{
+  "name": "katari-package-discord",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "FFI sidecar dependencies for the Katari `discord` package (src/discord.ts).",
+  "dependencies": {
+    "@katari-lang/port": "0.1.0-rc8",
+    "discord.js": "^14.16.3"
+  }
+}

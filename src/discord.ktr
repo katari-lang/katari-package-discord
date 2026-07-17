@@ -1,0 +1,90 @@
+// The Discord library: a gateway-client capability plus the watch / send agents. Independent of
+// the AI layer — an app wires the two together by handling `on_message` with whatever logic it
+// likes. The externals are implemented in `discord.ts` (the same module path, so they register
+// under `discord.*`). The one-line integration is the provider:
+// `use discord.provider(token = env.get_secret(key = "DISCORD_TOKEN"))`.
+//
+// Files are first-class on both directions: an incoming message's attachments arrive as `file`
+// values (the sidecar downloads each and uploads it over the blob side channel), and `send_message`
+// posts `file` values back as Discord attachments.
+
+@"The live Discord gateway connection (the JS client lives in the sidecar; the handle is opaque)."
+request get_discord_client() -> string
+
+@"Raised once per incoming message; the caller installs a handler to react however it likes.
+@files@ are the message's attachments, already lifted into `file` values."
+request on_message(
+  @"The message's text content." text: string,
+  @"The channel the message arrived in." channel_id: string,
+  @"The message's attachments, already lifted into `file` values." files: array[file],
+) -> null
+
+@"Provide the Discord gateway connection for the extent of the continuation: log in once, then serve
+`get_discord_client` to everything downstream."
+agent provider[R, effect E](
+  @"The bot token; it stays in the provider, passed straight to the sidecar login." token: string of private,
+  @"The block to run with the connection served to it." continuation: agent (value: null) -> R with {...E, get_discord_client},
+) -> R with E | io {
+  use handler (var client = create_discord_client(token = token)) {
+    request get_discord_client() { next client }
+  }
+  continuation(value = null)
+}
+
+@"Connect to Discord and log in; returns an opaque client handle. Prefer the provider."
+external agent create_discord_client(
+  @"The bot token to log in with." token: string of private,
+) -> string
+
+@"Low-level: post to a channel on a given client, with any files as attachments. Prefer the
+send_message agent."
+external agent discord_send(
+  @"The opaque client handle to post through." client: string,
+  @"The channel to post into." channel_id: string,
+  @"The message text; empty means an attachments-only post." text: string,
+  @"Files to attach to the post." files: array[file],
+) -> null
+
+@"Low-level: listen on a channel and deliver each message (text + attachments as files) to a
+callback. Prefer the watch_messages agent."
+external agent discord_watch(
+  @"The opaque client handle to listen through." client: string,
+  @"The channel to listen on." channel_id: string,
+  @"Called once per incoming message." deliver_to: agent (text: string, channel_id: string, files: array[file]) -> null with on_message,
+) -> never with on_message
+
+@"Post a message to a channel using the ambient Discord client; @files@ attach to it (pass `[]`
+for a plain text post — parameter defaults only take literals, so the empty array cannot default)."
+agent send_message(
+  @"The channel to post into." channel_id: string,
+  @"The message text; empty means an attachments-only post." text: string,
+  @"Files to attach; pass `[]` for a plain text post." files: array[file],
+) -> null {
+  discord_send(client = get_discord_client(), channel_id = channel_id, text = text, files = files)
+}
+
+@"Tool: post files (images) to a Discord channel, with a caption. Use the channel id given in the
+conversation context; pass each file as its handle object — a bare {\"$ref\": \"<id>\"} suffices."
+agent send_files(
+  @"The channel to post into (given in the conversation context)." channel_id: string,
+  @"The files to post; pass each as its handle object — a bare {\"$ref\": \"<id>\"} suffices." files: array[file],
+  @"The text posted alongside the files." caption: string,
+) -> null {
+  send_message(channel_id = channel_id, text = caption, files = files)
+}
+
+@"Bridge: turn each delivered message into an on_message request for the caller to handle."
+agent deliver(
+  @"The message's text content." text: string,
+  @"The channel the message arrived in." channel_id: string,
+  @"The message's attachments as `file` values." files: array[file],
+) -> null with on_message {
+  on_message(text = text, channel_id = channel_id, files = files)
+}
+
+@"Serve a channel forever, raising on_message for each message. Just provide the channel + a handler."
+agent watch_messages(
+  @"The channel to serve." channel_id: string,
+) -> never {
+  discord_watch(client = get_discord_client(), channel_id = channel_id, deliver_to = deliver)
+}

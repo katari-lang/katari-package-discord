@@ -1,0 +1,4 @@
+# CLI build artifacts and caches.
+.katari/
+# Sidecar (FFI) dependencies.
+node_modules/

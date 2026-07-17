@@ -1,0 +1,16 @@
+[package]
+name = "discord"
+version = "0.1.0"
+description = "A discord.js gateway client for Katari: a connection provider, watch/send agents, and file attachments in both directions. Ships an FFI sidecar (discord.ts)."
+
+[runtime]
+url = "http://localhost:3000"
+
+# The sidecar's source root defaults to [package].src ("src"), where discord.ts lives alongside
+# discord.ktr, so no explicit [sidecar] section is needed — `katari apply` bundles it into the
+# consumer's snapshot.
+
+[dependencies]
+registry = "https://raw.githubusercontent.com/katari-lang/katari-registry/main"
+snapshot = "staging"
+packages = []
