@@ -64,6 +64,21 @@ katari.agent<{ token: string }>("create_discord_client", async ({ token }) => {
   return handle;
 });
 
+katari.agent<{ client: string }>("discord_close", async ({ client }) => {
+  // The provider arms this as a `finally`, so a run that ends (completes, is cancelled, or unwinds)
+  // tears its gateway connection down: a client left alive stays logged in and keeps receiving events
+  // long after its run is gone.
+  const connection = clients.get(client);
+  // Idempotent: an unknown or already-closed handle is a no-op — a finalizer may run more than once,
+  // and a sidecar restart drops the map entirely.
+  if (connection === undefined) return null;
+  // Drop the entry before destroying so a re-run (or a concurrent lookup) cannot see it half-closed.
+  clients.delete(client);
+  // `destroy` logs the bot out and closes the gateway WebSocket — discord.js's documented shutdown.
+  await connection.destroy();
+  return null;
+});
+
 katari.agent<{ client: string; channel_id: string; text: string; files: KatariFile[] }>(
   "discord_send",
   async ({ client, channel_id, text, files }) => {

@@ -16,7 +16,12 @@ agent provider[R, effect E](
   @"The bot token; it stays in the provider, passed straight to the sidecar login." token: string of private,
   @"Runs with `get_discord_client` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, get_discord_client},
 ) -> R with E | io {
-  use handler (var client = create_discord_client(token = token)) {
+  let client = create_discord_client(token = token)
+  // Bind the gateway connection's lifetime to this run: however the provider ends — normal completion,
+  // cancel, or the continuation unwinding — destroy the client on the way out, so a dead run does not
+  // leave a logged-in gateway session still receiving and handling events.
+  finally { discord_close(client = client) }
+  use handler {
     request get_discord_client() { next client }
   }
   continuation(value = null)
@@ -26,6 +31,15 @@ agent provider[R, effect E](
 external agent create_discord_client(
   @"The bot token to log in with." token: string of private,
 ) -> string
+
+@"Close a Discord connection: destroy the gateway client and drop the handle. The provider arms this
+as a `finally`, so the connection dies with the run — a gateway client left alive stays logged in and
+keeps receiving events long after its run is gone, a leaked session that still handles messages.
+Idempotent: closing an unknown or already-closed handle is a no-op, since a finalizer may run more
+than once."
+external agent discord_close(
+  @"The opaque client handle `create_discord_client` returned." client: string,
+) -> null
 
 @"An authentication / authorization failure: the bot token is invalid or expired (HTTP 401), or the
 bot lacks permission in the channel (HTTP 403); @message@ carries Discord's error. The bot cannot
