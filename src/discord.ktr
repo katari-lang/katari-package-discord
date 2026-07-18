@@ -27,14 +27,31 @@ external agent create_discord_client(
   @"The bot token to log in with." token: string of private,
 ) -> string
 
-@"Low-level: post to a channel on a given client, with any files as attachments. Prefer the
-send_message agent."
+@"An authentication / authorization failure: the bot token is invalid or expired (HTTP 401), or the
+bot lacks permission in the channel (HTTP 403); @message@ carries Discord's error. The bot cannot
+recover on its own — the operator must fix the token or the bot's permissions and restart the run (the
+connection is fixed at start). Let it surface so the bot stops loudly rather than silently dropping
+every reply."
+data auth_error(message: string)
+
+@"A Discord API call failed for a non-auth reason: a rate limit (HTTP 429), a channel that is not a
+sendable text channel, a transient network fault; @message@ carries Discord's error. Usually
+per-message or transient, so a bot catches it to drop just that reply and keep serving."
+data api_error(message: string)
+
+// A Discord send failure: an auth/authorization failure or a plain API failure. Raised as a
+// `prelude.throw` (never a panic — that would tear the whole run down), classified in the sidecar by
+// the HTTP status. (Type synonyms take no docs.)
+type discord_error = auth_error | api_error
+
+@"Low-level: post to a channel on a given client, with any files as attachments. Raises `auth_error`
+or `api_error` (`discord_error`) when the Discord API call fails. Prefer the send_message agent."
 external agent discord_send(
   @"The opaque client handle to post through." client: string,
   @"The channel to post into." channel_id: string,
   @"The message text; empty means an attachments-only post." text: string,
   @"Files to attach to the post." files: array[file],
-) -> null
+) -> null with prelude.throw[discord_error]
 
 @"Low-level: listen on a channel and deliver each incoming message (channel_id / text / attachments
 as files) to a callback. Prefer the watch_messages agent."
@@ -45,7 +62,9 @@ external agent discord_watch[effect E](
 ) -> never with E
 
 @"Post a message to a channel using the ambient Discord client; @files@ attach to it (pass `[]`
-for a plain text post — parameter defaults only take literals, so the empty array cannot default)."
+for a plain text post — parameter defaults only take literals, so the empty array cannot default).
+Raises `discord_error` (`auth_error` | `api_error`) when the send fails — catch `api_error` to keep a
+bot serving past a transient failure, and let `auth_error` surface so a bad token stops the bot loudly."
 agent send_message(
   @"The channel to post into." channel_id: string,
   @"The message text; empty means an attachments-only post." text: string,
