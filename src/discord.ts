@@ -57,7 +57,15 @@ katari.agent<{ token: string }>("create_discord_client", async ({ token }) => {
       GatewayIntentBits.MessageContent,
     ],
   });
-  await client.login(token);
+  try {
+    // Logging in is the connect: an invalid token / missing permission or a transient network fault
+    // fails here. Raise it as the declared `prelude.throw[discord_error]`, classified auth vs api by
+    // HTTP status (the credential is fixed at start, so a bad token cannot recover), so the provider's
+    // caller can catch it instead of the run panicking. Nothing to close — the client never logged in.
+    await client.login(token);
+  } catch (error) {
+    katari.throw(new KatariData(discordErrorConstructor(error), { message: discordErrorMessage(error) }));
+  }
   const handle = `discord-${nextHandle}`;
   nextHandle += 1;
   clients.set(handle, client);

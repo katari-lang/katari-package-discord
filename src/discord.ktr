@@ -11,11 +11,13 @@
 request get_discord_client() -> string
 
 @"Provide the Discord gateway connection for the extent of the continuation: log in once, then serve
-`get_discord_client` to everything downstream."
+`get_discord_client` to everything downstream. A failed login (a bad token, a transient network fault)
+raises `discord_error` (`auth_error` | `api_error`) — the connection is fixed at start, so a bad
+credential surfaces here rather than on the first send."
 agent provider[R, effect E](
   @"The bot token; it stays in the provider, passed straight to the sidecar login." token: string of private,
   @"Runs with `get_discord_client` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, get_discord_client},
-) -> R with E | io {
+) -> R with E | io | prelude.throw[discord_error] {
   let client = create_discord_client(token = token)
   // Bind the gateway connection's lifetime to this run: however the provider ends — normal completion,
   // cancel, or the continuation unwinding — destroy the client on the way out, so a dead run does not
@@ -27,10 +29,12 @@ agent provider[R, effect E](
   continuation(value = null)
 }
 
-@"Connect to Discord and log in; returns an opaque client handle. Prefer the provider."
+@"Connect to Discord and log in; returns an opaque client handle. Raises `discord_error` (`auth_error`
+| `api_error`) when the login fails — an invalid token / missing permission is `auth_error`, a transient
+network fault `api_error`. Prefer the provider."
 external agent create_discord_client(
   @"The bot token to log in with." token: string of private,
-) -> string
+) -> string with prelude.throw[discord_error]
 
 @"Close a Discord connection: destroy the gateway client and drop the handle. The provider arms this
 as a `finally`, so the connection dies with the run — a gateway client left alive stays logged in and
