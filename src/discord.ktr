@@ -92,10 +92,10 @@ agent send_message(
 }
 
 @"Tool: post files (images) to a Discord channel, with a caption. Use the channel id given in the
-conversation context; pass each file as its handle object — a bare {\"$ref\": \"<id>\"} suffices."
+conversation context; pass each file as its handle object — a bare {\"$katari_ref\": \"<id>\"} suffices."
 agent send_files(
   @"The channel to post into (given in the conversation context)." channel_id: string,
-  @"The files to post; pass each as its handle object — a bare {\"$ref\": \"<id>\"} suffices." files: array[file],
+  @"The files to post; pass each as its handle object — a bare {\"$katari_ref\": \"<id>\"} suffices." files: array[file],
   @"The text posted alongside the files." caption: string,
 ) -> null {
   send_message(channel_id = channel_id, text = caption, files = files)
