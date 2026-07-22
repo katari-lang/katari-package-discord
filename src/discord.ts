@@ -87,19 +87,19 @@ katari.agent<{ client: string }>("discord_close", async ({ client }) => {
   return null;
 });
 
-katari.agent<{ client: string; channel_id: string; text: string; files: KatariFile[] }>(
+katari.agent<{ client: string; channel: string; text: string; files: KatariFile[] }>(
   "discord_send",
-  async ({ client, channel_id, text, files }) => {
+  async ({ client, channel, text, files }) => {
     // An unknown handle is a program defect (a `client` value the runtime never minted), so it stays a
     // bare throw = panic; only the Discord API calls below fail at execution and become a catchable
     // `discord_error`.
     const connection = connectionOf(client);
     try {
-      const channel = await connection.channels.fetch(channel_id);
-      if (channel === null || !channel.isSendable()) {
+      const target = await connection.channels.fetch(channel);
+      if (target === null || !target.isSendable()) {
         // Not a bug — a per-channel execution failure; the catch below tags it `api_error` (no HTTP
         // status).
-        throw new Error(`channel ${channel_id} is not a sendable text channel`);
+        throw new Error(`channel ${channel} is not a sendable text channel`);
       }
       // Each file's bytes come over the blob side channel; Discord wants a Buffer + a filename. The
       // slim handle carries no metadata, so the MIME type rides in with the same download.
@@ -109,7 +109,7 @@ katari.agent<{ client: string; channel_id: string; text: string; files: KatariFi
           name: attachmentName(await file.contentType(), index),
         })),
       );
-      await channel.send({
+      await target.send({
         // Discord rejects an empty content string; with attachments the text is optional.
         ...(text === "" ? {} : { content: text }),
         ...(attachments.length > 0 ? { files: attachments } : {}),
@@ -124,9 +124,9 @@ katari.agent<{ client: string; channel_id: string; text: string; files: KatariFi
   },
 );
 
-katari.agent<{ client: string; channel_id: string; deliver_to: KatariAgent }>(
+katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
   "discord_watch",
-  ({ client, channel_id, deliver_to }, context) => {
+  ({ client, channel, deliver_to }, context) => {
     const connection = connectionOf(client);
     return new Promise<never>((_resolve, reject) => {
       const listener = (message: {
@@ -135,7 +135,7 @@ katari.agent<{ client: string; channel_id: string; deliver_to: KatariAgent }>(
         content: string;
         attachments: Map<string, { url: string; contentType: string | null }>;
       }) => {
-        if (message.author.bot || message.channelId !== channel_id) return;
+        if (message.author.bot || message.channelId !== channel) return;
         // Deliver back into the runtime as an inner delegation; the callback's effects escalate
         // through this call to the app's handlers. Attachments download from the CDN and lift into
         // `file` values first (one that fails to download is dropped rather than failing the whole
@@ -153,7 +153,7 @@ katari.agent<{ client: string; channel_id: string; deliver_to: KatariAgent }>(
               }),
             );
           }
-          await deliver_to.call({ channel_id: message.channelId, text: message.content, files });
+          await deliver_to.call({ channel: message.channelId, text: message.content, files });
         })().catch((error) => {
           cleanup();
           reject(error instanceof Error ? error : new Error(String(error)));

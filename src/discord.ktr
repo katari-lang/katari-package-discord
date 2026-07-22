@@ -1,30 +1,31 @@
 // The Discord library: a gateway-client capability plus the watch / send agents, the Discord twin
 // of the Slack package. The externals are implemented in `discord.ts` (the same module path, so they
 // register under `discord.*`). The one-line integration is the provider:
-// `use discord.provider(token = env.get_secret(key = "DISCORD_TOKEN"))`.
+// `use discord.provider(source = credentials.env(key = "DISCORD_TOKEN"))`.
 //
 // Files are first-class on both directions: an incoming message's attachments arrive as `file`
 // values (the sidecar downloads each and uploads it over the blob side channel), and `send_message`
 // posts `file` values back as Discord attachments.
 
 @"The live Discord gateway connection (the JS client lives in the sidecar; the handle is opaque)."
-request get_discord_client() -> string
+request connection() -> string
 
-@"Provide the Discord gateway connection for the extent of the continuation: log in once, then serve
-`get_discord_client` to everything downstream. A failed login (a bad token, a transient network fault)
-raises `discord_error` (`auth_error` | `api_error`) — the connection is fixed at start, so a bad
-credential surfaces here rather than on the first send."
+@"Provide the Discord gateway connection for the extent of the continuation: resolve @source@ ONCE
+(a gateway credential is fixed at connect — the websocket's nature, so a rotation lands on the next
+restart, not mid-connection), log in, then serve `connection` to everything downstream. A failed
+login (a bad token, a transient network fault) raises `discord_error` (`auth_error` | `api_error`) —
+surfacing here rather than on the first send."
 agent provider[R, effect E](
-  @"The bot token; it stays in the provider, passed straight to the sidecar login." token: string of private,
-  @"Runs with `get_discord_client` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, get_discord_client},
-) -> R with E | io | prelude.throw[discord_error] {
-  let client = create_discord_client(token = token)
+  @"Where the bot token lives (env key or oauth name); resolved once at connect." source: credentials.source,
+  @"Runs with `connection` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, connection},
+) -> R with E | io | prelude.throw[discord_error | env.missing_secret | oauth.server_error] {
+  let client = create_discord_client(token = credentials.resolve(source = source))
   // Bind the gateway connection's lifetime to this run: however the provider ends — normal completion,
   // cancel, or the continuation unwinding — destroy the client on the way out, so a dead run does not
   // leave a logged-in gateway session still receiving and handling events.
   finally { discord_close(client = client) }
   use handler {
-    request get_discord_client() { next client }
+    request connection() { next client }
   }
   continuation(value = null)
 }
@@ -66,17 +67,17 @@ type discord_error = auth_error | api_error
 or `api_error` (`discord_error`) when the Discord API call fails. Prefer the send_message agent."
 external agent discord_send(
   @"The opaque client handle to post through." client: string,
-  @"The channel to post into." channel_id: string,
+  @"The channel to post into." channel: string,
   @"The message text; empty means an attachments-only post." text: string,
   @"Files to attach to the post." files: array[file],
 ) -> null with prelude.throw[discord_error]
 
-@"Low-level: listen on a channel and deliver each incoming message (channel_id / text / attachments
+@"Low-level: listen on a channel and deliver each incoming message (channel / text / attachments
 as files) to a callback. Prefer the watch_messages agent."
 external agent discord_watch[effect E](
   @"The opaque client handle to listen through." client: string,
-  @"The channel to listen on." channel_id: string,
-  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel_id: string, text: string, files: array[file]) -> null with E,
+  @"The channel to listen on." channel: string,
+  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, text: string, files: array[file]) -> null with E,
 ) -> never with E
 
 @"Post a message to a channel using the ambient Discord client; @files@ attach to it (pass `[]`
@@ -84,29 +85,29 @@ for a plain text post — parameter defaults only take literals, so the empty ar
 Raises `discord_error` (`auth_error` | `api_error`) when the send fails — catch `api_error` to keep a
 bot serving past a transient failure, and let `auth_error` surface so a bad token stops the bot loudly."
 agent send_message(
-  @"The channel to post into." channel_id: string,
+  @"The channel to post into." channel: string,
   @"The message text; empty means an attachments-only post." text: string,
   @"Files to attach; pass `[]` for a plain text post." files: array[file],
 ) -> null {
-  discord_send(client = get_discord_client(), channel_id = channel_id, text = text, files = files)
+  discord_send(client = connection(), channel = channel, text = text, files = files)
 }
 
 @"Tool: post files (images) to a Discord channel, with a caption. Use the channel id given in the
 conversation context; pass each file as its handle object — a bare {\"$katari_ref\": \"<id>\"} suffices."
 agent send_files(
-  @"The channel to post into (given in the conversation context)." channel_id: string,
+  @"The channel to post into (given in the conversation context)." channel: string,
   @"The files to post; pass each as its handle object — a bare {\"$katari_ref\": \"<id>\"} suffices." files: array[file],
   @"The text posted alongside the files." caption: string,
 ) -> null {
-  send_message(channel_id = channel_id, text = caption, files = files)
+  send_message(channel = channel, text = caption, files = files)
 }
 
 @"Serve a channel forever, delivering each incoming message to @deliver_to@ — shaped like
 `time.watch` / `google_calendar.watch` so it composes under `parallel [ … ]`. Bot posts (this bot's
 own replies included) are not delivered, so replying from @deliver_to@ cannot loop."
 agent watch_messages[effect E](
-  @"The channel to serve." channel_id: string,
-  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel_id: string, text: string, files: array[file]) -> null with E,
-) -> never with E | get_discord_client | io {
-  discord_watch(client = get_discord_client(), channel_id = channel_id, deliver_to = deliver_to)
+  @"The channel to serve." channel: string,
+  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, text: string, files: array[file]) -> null with E,
+) -> never with E | connection | io {
+  discord_watch(client = connection(), channel = channel, deliver_to = deliver_to)
 }
