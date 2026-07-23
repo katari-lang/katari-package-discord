@@ -119,17 +119,20 @@ katari.agent<{ client: string; channel: string; text: string; files: KatariFile[
           name: attachmentName(await file.contentType(), index),
         })),
       );
-      await target.send({
+      const posted = await target.send({
         // Discord rejects an empty content string; with attachments the text is optional.
         ...(text === "" ? {} : { content: text }),
         ...(attachments.length > 0 ? { files: attachments } : {}),
       });
-      return null;
+      // The posted message's id — the seam a later edit / reaction / thread reply addresses.
+      return posted.id;
     } catch (error) {
       // Raise the execution failure as the declared `prelude.throw[discord_error]`, classified auth vs
       // api by HTTP status (qualified constructor name — the boundary checks the tag against the schema
       // const), so the caller can catch it instead of the run panicking.
       katari.throw(new KatariData(discordErrorConstructor(error), { message: discordErrorMessage(error) }));
+      // `katari.throw` never returns; the rethrow only satisfies the declared return type.
+      throw error;
     }
   },
 );

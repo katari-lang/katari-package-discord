@@ -63,21 +63,25 @@ data api_error(message: string)
 // the HTTP status. (Type synonyms take no docs.)
 type discord_error = auth_error | api_error
 
-@"Low-level: post to a channel on a given client, with any files as attachments. Raises `auth_error`
-or `api_error` (`discord_error`) when the Discord API call fails. Prefer the send_message agent."
+@"Low-level: post to a channel on a given client, with any files as attachments, returning the posted
+message's id. Raises `auth_error` or `api_error` (`discord_error`) when the Discord API call fails.
+Prefer the send_message agent."
 external agent discord_send(
   @"The opaque client handle to post through." client: string,
   @"The channel to post into." channel: string,
   @"The message text; empty means an attachments-only post." text: string,
   @"Files to attach to the post." files: array[file],
-) -> null with prelude.throw[discord_error]
+) -> string with prelude.throw[discord_error]
 
 @"Post @prompt@ with one BUTTON per option to a channel and BLOCK until someone there clicks one,
 returning the clicked label verbatim — the built-in human-approval UI (an `ai.authorize_monitor`
 provider asking an operators' channel, a confirmation step before an irreversible action). Put the
 prompt in a channel whose MEMBERSHIP is the trust boundary: any member may click. The wait rides one
 external call, so a runtime restart while it is open interrupts it under the at-most-once rule (a
-catchable panic) and the posted buttons go stale. Raises `discord_error` when the post fails."
+catchable panic) and the posted buttons go stale. That failure is the DESIGNED outcome, not a defect
+to absorb here: let the panic ride to your supervisor and restart the asking flow — whoever wanted
+the answer asks again — rather than guessing an answer for a click that never landed. Raises
+`discord_error` when the post fails."
 agent ask(
   @"The channel to ask in — its membership is who may answer." channel: string,
   @"The question posted above the buttons." prompt: string,
@@ -102,25 +106,55 @@ external agent discord_watch[effect E](
   @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, text: string, files: array[file], author: string) -> null with E,
 ) -> never with E
 
-@"Post a message to a channel using the ambient Discord client; @files@ attach to it (pass `[]`
-for a plain text post — parameter defaults only take literals, so the empty array cannot default).
-Raises `discord_error` (`auth_error` | `api_error`) when the send fails — catch `api_error` to keep a
-bot serving past a transient failure, and let `auth_error` surface so a bad token stops the bot loudly."
+@"Post a message to a channel using the ambient Discord client, returning the posted MESSAGE'S ID —
+the composable seam a later edit / reaction / thread-reply agent will address a message by, so a
+caller that needs to refer back keeps it (and one that does not simply drops it). @files@ attach to
+the post. Raises `discord_error` (`auth_error` | `api_error`) when the send fails — catch `api_error`
+to keep a bot serving past a transient failure, and let `auth_error` surface so a bad token stops the
+bot loudly."
 agent send_message(
   @"The channel to post into." channel: string,
   @"The message text; empty means an attachments-only post." text: string,
-  @"Files to attach; pass `[]` for a plain text post." files: array[file],
-) -> null {
+  @"Files to attach; defaults to none." files: array[file] ?= [],
+) -> string {
   discord_send(client = connection(), channel = channel, text = text, files = files)
 }
 
-@"Tool: post files (images) to a Discord channel, with a caption. Use the channel id given in the
-conversation context; pass each file as its handle object — a bare {\"$katari_ref\": \"<id>\"} suffices."
+@"Post RESILIENTLY, fire-and-forget — the composition every long-lived bot writes around
+`send_message`, packaged: a blank @text@ with no @files@ posts nothing (a quiet protocol's silence);
+a transient `api_error` (a rate limit, an unsendable channel) drops just this post so the bot keeps
+serving; `auth_error` re-raises so a bad token still stops the bot loudly. The posted message's id
+is deliberately dropped — a caller that needs it wants `send_message` and its own error policy."
+agent try_send(
+  @"The channel to post into." channel: string,
+  @"The message text; blank with no files posts nothing." text: string,
+  @"Files to attach; defaults to none." files: array[file] ?= [],
+) -> null {
+  if (string.is_blank(value = text) && array.length(target = files) == 0) {
+    null
+  } else {
+    use handler {
+      request prelude.throw(error: discord_error) -> never {
+        match (error) {
+          case api_error(message => _) -> { break null }
+          // The residual is exactly `auth_error` — rethrown as bound, no reconstruction.
+          case rest -> { prelude.throw(error = rest) }
+        }
+      }
+    }
+    let _message_id = send_message(channel = channel, text = text, files = files)
+    null
+  }
+}
+
+@"Tool: post files (images) to a Discord channel, with a caption; returns the posted message's id.
+Use the channel id given in the conversation context; pass each file as its handle object — a bare
+{\"$katari_ref\": \"<id>\"} suffices."
 agent send_files(
   @"The channel to post into (given in the conversation context)." channel: string,
   @"The files to post; pass each as its handle object — a bare {\"$katari_ref\": \"<id>\"} suffices." files: array[file],
   @"The text posted alongside the files." caption: string,
-) -> null {
+) -> string {
   send_message(channel = channel, text = caption, files = files)
 }
 
