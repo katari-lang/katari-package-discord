@@ -72,6 +72,28 @@ external agent discord_send(
   @"Files to attach to the post." files: array[file],
 ) -> null with prelude.throw[discord_error]
 
+@"Post @prompt@ with one BUTTON per option to a channel and BLOCK until someone there clicks one,
+returning the clicked label verbatim — the built-in human-approval UI (an `ai.authorize_monitor`
+provider asking an operators' channel, a confirmation step before an irreversible action). Put the
+prompt in a channel whose MEMBERSHIP is the trust boundary: any member may click. The wait rides one
+external call, so a runtime restart while it is open interrupts it under the at-most-once rule (a
+catchable panic) and the posted buttons go stale. Raises `discord_error` when the post fails."
+agent ask(
+  @"The channel to ask in — its membership is who may answer." channel: string,
+  @"The question posted above the buttons." prompt: string,
+  @"One button label per option; the clicked label is returned." options: array[string],
+) -> string {
+  discord_ask(client = connection(), channel = channel, prompt = prompt, options = options)
+}
+
+@"Low-level: post a button prompt on a given client and await the click. Prefer the ask agent."
+external agent discord_ask(
+  @"The opaque client handle to post through." client: string,
+  @"The channel to ask in." channel: string,
+  @"The question posted above the buttons." prompt: string,
+  @"One button label per option." options: array[string],
+) -> string with prelude.throw[discord_error]
+
 @"Low-level: listen on a channel and deliver each incoming message (channel / text / attachments
 as files) to a callback. Prefer the watch_messages agent."
 external agent discord_watch[effect E](

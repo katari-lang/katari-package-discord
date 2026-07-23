@@ -7,7 +7,17 @@
 // CDN and upload over the same side channel, so the delivered message carries real `file` values.
 
 import { katari, KatariData, type KatariAgent, type KatariFile } from "@katari-lang/port";
-import { Client, Events, GatewayIntentBits } from "discord.js";
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  type ButtonInteraction,
+  ButtonStyle,
+  Client,
+  ComponentType,
+  Events,
+  GatewayIntentBits,
+  type Message,
+} from "discord.js";
 
 const clients = new Map<string, Client>();
 let nextHandle = 1;
@@ -121,6 +131,58 @@ katari.agent<{ client: string; channel: string; text: string; files: KatariFile[
       // const), so the caller can catch it instead of the run panicking.
       katari.throw(new KatariData(discordErrorConstructor(error), { message: discordErrorMessage(error) }));
     }
+  },
+);
+
+katari.agent<{ client: string; channel: string; prompt: string; options: string[] }>(
+  "discord_ask",
+  async ({ client, channel, prompt, options }, context) => {
+    const connection = connectionOf(client);
+    let posted: Message;
+    try {
+      const target = await connection.channels.fetch(channel);
+      if (target === null || !target.isSendable()) {
+        throw new Error(`channel ${channel} is not a sendable text channel`);
+      }
+      // One button per option; the customId is the option INDEX so the label itself (which Discord
+      // caps at 80 characters) never has to round-trip as an identifier.
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        options.map((label, index) =>
+          new ButtonBuilder().setCustomId(String(index)).setLabel(label).setStyle(ButtonStyle.Primary),
+        ),
+      );
+      posted = await target.send({ content: prompt, components: [row] });
+    } catch (error) {
+      // Posting the prompt is the Discord API call that can fail; classify and raise it as the
+      // declared `discord_error` exactly as discord_send does.
+      katari.throw(new KatariData(discordErrorConstructor(error), { message: discordErrorMessage(error) }));
+      // `katari.throw` never returns; the rethrow only satisfies definite assignment on `posted`.
+      throw error;
+    }
+    // The wait: the FIRST button click on this message answers it. No time limit — the decision may
+    // land hours later; a runtime restart interrupts the external call under the at-most-once rule.
+    return new Promise<string>((resolve, reject) => {
+      const collector = posted.createMessageComponentCollector({
+        componentType: ComponentType.Button,
+        max: 1,
+      });
+      collector.on("collect", (interaction: ButtonInteraction) => {
+        void (async () => {
+          const chosen = options[Number(interaction.customId)] ?? interaction.customId;
+          // Strip the buttons and show the outcome, so the channel keeps a readable record and a
+          // second click has nothing to press.
+          await interaction.update({ content: `${prompt}\n→ ${chosen} (by ${interaction.user.tag})`, components: [] });
+          resolve(chosen);
+        })().catch((error) => reject(error instanceof Error ? error : new Error(String(error))));
+      });
+      // The runtime cancelled the call (run cancel / teardown): stop collecting and settle. The
+      // stale buttons stay in the channel; clicking them later gets Discord's own "interaction
+      // failed" notice.
+      context.signal.addEventListener("abort", () => {
+        collector.stop();
+        reject(new Error("cancelled"));
+      });
+    });
   },
 );
 
