@@ -130,7 +130,7 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
     const connection = connectionOf(client);
     return new Promise<never>((_resolve, reject) => {
       const listener = (message: {
-        author: { bot: boolean };
+        author: { bot: boolean; id: string };
         channelId: string;
         content: string;
         attachments: Map<string, { url: string; contentType: string | null }>;
@@ -153,7 +153,14 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
               }),
             );
           }
-          await deliver_to.call({ channel: message.channelId, text: message.content, files });
+          await deliver_to.call({
+            channel: message.channelId,
+            text: message.content,
+            files,
+            // The raw snowflake; the Katari side decides whether and how to hash it before it
+            // leaves the program.
+            author: message.author.id,
+          });
         })().catch((error) => {
           cleanup();
           reject(error instanceof Error ? error : new Error(String(error)));

@@ -77,7 +77,7 @@ as files) to a callback. Prefer the watch_messages agent."
 external agent discord_watch[effect E](
   @"The opaque client handle to listen through." client: string,
   @"The channel to listen on." channel: string,
-  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, text: string, files: array[file]) -> null with E,
+  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, text: string, files: array[file], author: string) -> null with E,
 ) -> never with E
 
 @"Post a message to a channel using the ambient Discord client; @files@ attach to it (pass `[]`
@@ -104,10 +104,13 @@ agent send_files(
 
 @"Serve a channel forever, delivering each incoming message to @deliver_to@ — shaped like
 `time.watch` / `google_calendar.watch` so it composes under `parallel [ … ]`. Bot posts (this bot's
-own replies included) are not delivered, so replying from @deliver_to@ cannot loop."
+own replies included) are not delivered, so replying from @deliver_to@ cannot loop. @author@ is the
+sender's raw Discord user id (a snowflake — an opaque numeric id, not a name); hash it
+(`crypto.sha256`) before letting it leave the program, e.g. as an AI provider's abuse-attribution
+tag."
 agent watch_messages[effect E](
   @"The channel to serve." channel: string,
-  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, text: string, files: array[file]) -> null with E,
+  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, text: string, files: array[file], author: string) -> null with E,
 ) -> never with E | connection | io {
   discord_watch(client = connection(), channel = channel, deliver_to = deliver_to)
 }
