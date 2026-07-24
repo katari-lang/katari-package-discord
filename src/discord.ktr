@@ -161,9 +161,9 @@ agent send_files(
 @"Serve a channel forever, delivering each incoming message to @deliver_to@ — shaped like
 `time.watch` / `google_calendar.watch` so it composes under `parallel [ … ]`. Bot posts (this bot's
 own replies included) are not delivered, so replying from @deliver_to@ cannot loop. @author@ is the
-sender's raw Discord user id (a snowflake — an opaque numeric id, not a name); hash it
-(`crypto.sha256`) before letting it leave the program, e.g. as an AI provider's abuse-attribution
-tag."
+sender's raw Discord user id (a snowflake — an ENUMERABLE numeric id, not a name); a plain digest of
+an enumerable id is dictionary-reversible, so tag it with `crypto.hmac_sha256` under a secret key
+before letting it leave the program, e.g. as an AI provider's abuse-attribution tag."
 agent watch_messages[effect E](
   @"The channel to serve." channel: string,
   @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, text: string, files: array[file], author: string) -> null with E,
