@@ -6,23 +6,28 @@ top — the Discord twin of the Slack package. The connection is **owned by the 
 once, and every call in its scope shares the same live gateway client. Independent of any AI layer:
 an app reacts to messages with whatever agent it hands to `watch_messages` as `deliver_to`.
 
-- `discord.provider(token = ...)` — logs in once and serves the connection for the extent of the
-  continuation.
-- `discord.watch_messages(channel_id, deliver_to)` — serve a channel forever, delivering each
-  incoming message (`channel_id` / `text` / `files`) to your agent. Bot posts (this bot's own
-  replies included) are not delivered, so replying cannot loop. Never resolves; composes under
+- `discord.provider(source = ...)` — resolves the bot token ONCE (a `credentials.source`) and serves
+  the connection for the extent of the continuation.
+- `discord.watch_messages(channel, deliver_to)` — serve a channel forever, delivering each incoming
+  message (`channel` / `text` / `files` / `author`) to your agent. Bot posts (this bot's own replies
+  included) are not delivered, so replying cannot loop. Never resolves; composes under
   `parallel [ … ]`.
-- `discord.send_message(channel_id, text, files)` — post to a channel; pass `[]` for a plain text
-  post.
-- `discord.send_files(channel_id, files, caption)` — the tool shape of `send_message`, for an AI
-  loop's tool list.
+- `discord.send_message(channel, text, files ?= [])` — post to a channel, returning the posted
+  message's id; pass `[]` (or omit) for a plain text post.
+- `discord.try_send(channel, text, files ?= [])` — the resilient wrapper every bot writes: a blank
+  text with no files posts nothing, a transient `api_error` drops just this post, and `auth_error`
+  still re-raises.
+- `discord.ask(channel, prompt, options)` — post a button prompt and BLOCK until a member of the
+  channel clicks, returning the clicked label. The channel's membership is the trust boundary.
+- `discord.send_files(channel, files, caption)` — the tool shape of `send_message`, for an AI loop's
+  tool list.
 
 Files are first-class in both directions: an incoming message's attachments arrive as `file` values
 (the sidecar downloads each from Discord's CDN and uploads it over the blob side channel), and
 `send_message` posts `file` values back as Discord attachments.
 
-The low-level externals (`create_discord_client`, `discord_send`, `discord_watch`) are implemented
-in the sidecar, which keeps the live clients in a module-level map keyed by opaque handle.
+The low-level externals (`create_discord_client`, `discord_send`, `discord_ask`, `discord_watch`) are
+implemented in the sidecar, which keeps the live clients in a module-level map keyed by opaque handle.
 
 ## Secrets / env
 
@@ -48,13 +53,13 @@ pure-Katari consumer that never applies this package does not need them.)
 import discord
 
 // Echo every message back to the channel it came from, attachments included.
-agent echo(channel_id: string, text: string, files: array[file]) -> null {
-  discord.send_message(channel_id = channel_id, text = f"echo: ${text}", files = files)
+agent echo(channel: string, text: string, files: array[file], author: string) -> null {
+  discord.try_send(channel = channel, text = f"echo: ${text}", files = files)
 }
 
-agent echo_bot(channel_id: string) -> never {
-  use discord.provider(token = env.get_secret(key = "DISCORD_TOKEN"))
-  discord.watch_messages(channel_id = channel_id, deliver_to = echo)
+agent echo_bot(channel: string) -> never {
+  use discord.provider(source = credentials.env(key = "DISCORD_TOKEN"))
+  discord.watch_messages(channel = channel, deliver_to = echo)
 }
 ```
 
