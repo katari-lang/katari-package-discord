@@ -30,6 +30,14 @@ Files are first-class in both directions: an incoming message's attachments arri
 The low-level externals (`create_discord_client`, `discord_send`, `discord_ask`, `discord_watch`) are
 implemented in the sidecar, which keeps the live clients in a module-level map keyed by opaque handle.
 
+**Delivery**: within one live gateway connection each message reaches `deliver_to` exactly once, in
+order. Across a **reconnect** nothing is guaranteed in either direction — the gateway has no per-event
+acknowledgement, so a message can be missed (an invalidated session, an outage past the resume window,
+or the run itself restarting all re-identify, and Discord backfills nothing onto a fresh session) and,
+far more rarely, repeated (a resume replays from the last sequence the shard recorded, which advances
+when an event *arrives*, not after `deliver_to` returns). No dedup memory is kept here. A bot that must
+miss nothing reconciles against the channel's own history.
+
 ## Asking a human: controls in, an answer out
 
 `ask` takes **data** — a list of `control` values — and returns **data**: which control was completed
@@ -88,6 +96,34 @@ match (discord.ask(
 ```
 
 A form of one *empty* field is the free-text shape; a `select` over a computed list is the pick shape.
+
+Once a question is answered the controls come off and the outcome stays: `→ <the control's label, or
+the picked option> (by @who)`. So a `button`'s `label` and a `select`'s `option` strings are not only
+what a human clicks — they become the channel's lasting, public account of what was decided. Write
+them as the audit line you would want to find later. That line names the answerer as a Discord
+mention; the `by` the `answer` carries is the raw id.
+
+## Divergences from the slack twin
+
+The two packages carry the same data types with the same fields. Everything that differs is here:
+
+- **`message.thread`** — Slack's only extra field, absent here. Slack addresses a thread by its
+  parent's `ts`, which doubles as the message's identity; Discord has no such value, so its `message`
+  is the first four fields of Slack's.
+- **`form.title` is capped at 24 characters** — the tighter of the two platforms' caps (Discord's own
+  is 45), so a title that fits the twin fits here. Every other cap is each platform's own: Discord
+  takes an ≤80-character button label and ≤25 options of ≤100 characters where Slack takes 75.
+- **`discord_error` classification** — the same two constructors as Slack's `slack_error`, but
+  classified from HTTP status (401/403 → `auth_error`) rather than from Slack's error strings.
+- **Delivery guarantee** — Slack's socket acknowledges each event and re-sends an acknowledgement it
+  lost, so that side is **at-least-once**. Discord's gateway acknowledges nothing per event, so this
+  side guarantees **neither** across a reconnect: a message may be missed, and far more rarely
+  repeated (see *Delivery*, above). A program that needs one uniform guarantee across both must
+  supply it itself.
+
+Form validation is *not* on that list, deliberately: both sides make every input optional and both
+return `values` total over the declared fields, with a blank box as `""`. Neither invents a check the
+`field` type has no knob for.
 
 ## Secrets / env
 

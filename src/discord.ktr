@@ -146,7 +146,16 @@ shaped like `time.watch` / `google_calendar.watch` so it composes under `paralle
 @author@ on the delivered message is the sender's raw Discord user id (a snowflake — an ENUMERABLE
 numeric id, not a name); a plain digest of an enumerable id is dictionary-reversible, so tag it with
 `crypto.hmac_sha256` under a secret key before letting it leave the program, e.g. as an AI provider's
-abuse-attribution tag."
+abuse-attribution tag.
+
+Delivery is exactly once WITHIN one live gateway connection, and NOT GUARANTEED either way across a
+reconnect — which is where this differs from the Slack twin's at-least-once. The gateway has no
+per-event acknowledgement, so a message can be MISSED: an invalidated session, an outage past the
+resume window, or this run restarting each re-identify, and Discord backfills nothing onto a fresh
+session. A message can also be REPEATED, though far more rarely: a resume replays from the last
+sequence the shard RECORDED, which it advances when an event ARRIVES rather than after @deliver_to@
+returns. No dedup memory is kept here. A bot that must miss nothing reconciles against the channel's
+own history rather than trusting this stream."
 agent watch_messages[effect E](
   @"The channel to serve." channel: string,
   @"Called once per incoming message, with the whole message as one value; its effects E flow to the caller's handlers." deliver_to: agent (message: message) -> null with E,
@@ -253,6 +262,13 @@ press. A question that ends WITHOUT an answer is stripped the same way and left 
 an expiry, a cancel or a teardown never abandons live controls in the channel for someone to press
 into nothing. Stripping is best effort either way — if the edit itself fails the stale controls stay,
 and clicking one gets Discord's own \"interaction failed\" notice.
+
+What that record READS is the control's own text — a `button`'s or `form`'s @label@, a `select`'s
+picked @option@ — so those strings are not merely what a human clicks: they become the channel's
+lasting, public account of what was decided. Write them as the audit line you would want to find
+later. The record names the answerer as a Discord MENTION (the channel renders it as a name), while
+the @by@ the `answer` carries is the raw id — the readable form is for the channel, the correlatable
+one for the program.
 
 `ask` holds NO time limit, deliberately: a deadline is `time.with_deadline` wrapped around it and a
 withdrawal is `region.cancel_by_id` on the fiber holding it. One blocking question composes with
