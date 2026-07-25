@@ -1,26 +1,27 @@
 # discord — the Discord gateway, as Katari agents
 
 A single module, `discord`, plus its FFI sidecar `src/discord.ts`: a
-[discord.js](https://discord.js.org) gateway client behind a provider, with watch / send agents on
-top — the Discord twin of the Slack package. The connection is **owned by the provider** — log in
-once, and every call in its scope shares the same live gateway client. Independent of any AI layer:
-an app reacts to messages with whatever agent it hands to `watch_messages` as `deliver_to`.
+[discord.js](https://discord.js.org) gateway client behind a provider — the Discord twin of the Slack
+package. The connection is **owned by the provider** — log in once, and every call in its scope shares
+the same live gateway client. Independent of any AI layer: an app reacts to messages with whatever
+agent it hands to `watch_messages` as `deliver_to`.
+
+The surface is two planes: **messages** in and out, and **one interaction primitive**, `ask`.
 
 - `discord.provider(source = ...)` — resolves the bot token ONCE (a `credentials.source`) and serves
   the connection for the extent of the continuation.
 - `discord.watch_messages(channel, deliver_to)` — serve a channel forever, delivering each incoming
-  message (`channel` / `text` / `files` / `author`) to your agent. Bot posts (this bot's own replies
-  included) are not delivered, so replying cannot loop. Never resolves; composes under
-  `parallel [ … ]`.
+  message to your agent as one `discord.message(channel, author, text, files)` value. Bot posts (this
+  bot's own replies included) are not delivered, so replying cannot loop. Never resolves; composes
+  under `parallel [ … ]`.
 - `discord.send_message(channel, text, files ?= [])` — post to a channel, returning the posted
   message's id; pass `[]` (or omit) for a plain text post.
 - `discord.try_send(channel, text, files ?= [])` — the resilient wrapper every bot writes: a blank
   text with no files posts nothing, a transient `api_error` drops just this post, and `auth_error`
   still re-raises.
-- `discord.ask(channel, prompt, options)` — post a button prompt and BLOCK until a member of the
-  channel clicks, returning the clicked label. The channel's membership is the trust boundary.
-- `discord.send_files(channel, files, caption)` — the tool shape of `send_message`, for an AI loop's
-  tool list.
+- `discord.ask(channel, prompt, controls) -> answer` — post the prompt with its controls as one
+  message and BLOCK until someone in the channel completes one of them. The channel's membership is
+  the trust boundary; the first completed interaction is the answer.
 
 Files are first-class in both directions: an incoming message's attachments arrive as `file` values
 (the sidecar downloads each from Discord's CDN and uploads it over the blob side channel), and
@@ -28,6 +29,63 @@ Files are first-class in both directions: an incoming message's attachments arri
 
 The low-level externals (`create_discord_client`, `discord_send`, `discord_ask`, `discord_watch`) are
 implemented in the sidecar, which keeps the live clients in a module-level map keyed by opaque handle.
+
+## Asking a human: controls in, an answer out
+
+`ask` takes **data** — a list of `control` values — and returns **data**: which control was completed
+and with what. Approval, free-form text, editing a draft and picking from a list are that one call
+with different controls, not four agents.
+
+| control | renders as | answers with |
+| --- | --- | --- |
+| `button(id, label)` | a button; pressing it answers | `clicked(id, by)` |
+| `select(id, label, options)` | a dropdown (`label` is its placeholder) | `chose(id, option, by)` |
+| `form(id, label, title, fields)` | a button that opens a dialog of `field(id, label, value ?= "", multiline ?= false)` boxes; submitting answers | `submitted(id, values, by)` |
+
+A form is two Discord steps because that is Discord's physics — text input exists only in a dialog, and
+a dialog opens only in reply to a click. Opening a dialog and closing it again completes nothing, so
+the question stays open. Once answered, the controls come off the message and the outcome is left in
+their place.
+
+Keep a `form`'s `title` to **24 characters**: that is the twin contract's bound rather than Discord's
+own (which allows 45), so a form written here renders unchanged on the Slack twin, whose dialog title
+caps at 24. Discord's other caps are its own — a button label ≤80, a dropdown of ≤25 options of ≤100
+characters, 1–5 fields per dialog, a field value ≤4000 — and exceeding one is a payload the platform
+rejects, surfacing as `api_error`.
+
+`ask` holds **no time limit**: a deadline is `time.with_deadline` around it, a withdrawal is
+`region.cancel_by_id` on the fiber holding it. `by` is the answerer's raw Discord snowflake — an
+enumerable id, so tag it with `crypto.hmac_sha256` before it leaves the program.
+
+```katari
+// Approval: two buttons, and the program branches on the id it wrote.
+match (discord.ask(
+  channel = channel,
+  prompt = f"Approve: ${what}?",
+  controls = [discord.button(id = "approve", label = "approve"), discord.button(id = "deny", label = "deny")],
+)) {
+  case discord.clicked(id => "approve", by => _) -> do_it()
+  case rest -> skip()
+}
+
+// Editing a draft: a PREFILLED form beside a deny button. A submit is approval AT THOSE VALUES.
+match (discord.ask(
+  channel = channel,
+  prompt = "Send this mail? Edit and submit to send, or deny.",
+  controls = [
+    discord.form(id = "send", label = "edit & send", title = "mail draft", fields = [
+      discord.field(id = "subject", label = "subject", value = subject),
+      discord.field(id = "body", label = "body", value = body, multiline = true),
+    ]),
+    discord.button(id = "deny", label = "deny"),
+  ],
+)) {
+  case discord.submitted(id => _, values => values, by => _) -> send(values = values)
+  case rest -> refuse()
+}
+```
+
+A form of one *empty* field is the free-text shape; a `select` over a computed list is the pick shape.
 
 ## Secrets / env
 
@@ -53,8 +111,8 @@ pure-Katari consumer that never applies this package does not need them.)
 import discord
 
 // Echo every message back to the channel it came from, attachments included.
-agent echo(channel: string, text: string, files: array[file], author: string) -> null {
-  discord.try_send(channel = channel, text = f"echo: ${text}", files = files)
+agent echo(message: discord.message) -> null {
+  discord.try_send(channel = message.channel, text = f"echo: ${message.text}", files = message.files)
 }
 
 agent echo_bot(channel: string) -> never {
@@ -63,5 +121,6 @@ agent echo_bot(channel: string) -> never {
 }
 ```
 
-Hand `discord.send_files` to an AI loop's tool list to let the model post images and other files to
-the channel on its own.
+To hand file posting to an AI loop as a tool, bind `discord.send_message` under a role-specific
+description with a doc-on-`let` — the package no longer ships a separate `send_files` wrapper, because
+a wrapper that differed only in argument order and doc text was one agent too many.
