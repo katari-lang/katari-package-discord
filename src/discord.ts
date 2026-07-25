@@ -11,7 +11,14 @@
 // to a click. So a katari `form` control renders as a button that opens the dialog — two Discord steps
 // behind one katari answer.
 
-import { katari, KatariData, type KatariAgent, type KatariFile, KatariThrowError } from "@katari-lang/port";
+import {
+  katari,
+  KatariCancelledError,
+  KatariData,
+  type KatariAgent,
+  type KatariFile,
+  KatariThrowError,
+} from "@katari-lang/port";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -497,7 +504,11 @@ katari.agent<{ client: string; channel: string; prompt: string; controls: unknow
         // edit (nor break on one — `stripControls` swallows its own failure). The cancel settles now and
         // the edit lands when Discord answers it.
         void stripControls(posted, prompt, "(expired)");
-        reject(new Error("discord ask cancelled"));
+        // `KatariCancelledError` is the rejection the port expects from a handler unwinding on abort, and
+        // it confirms the cancel QUIETLY. A plain `Error` is confirmed too, but reported as "handler threw
+        // during cancellation" — which, since a deadline around `ask` is the recommended composition,
+        // would print a phantom diagnostic every time a question simply expired.
+        reject(new KatariCancelledError());
       });
     });
   },
@@ -551,10 +562,13 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
       };
       const cleanup = () => connection.off(Events.MessageCreate, listener);
       connection.on(Events.MessageCreate, listener);
-      // The runtime cancelled the call (run cancel / teardown): stop listening and settle.
+      // The runtime cancelled the call (run cancel / teardown): stop listening and settle. Rejected with
+      // the port's own `KatariCancelledError`, the type it expects from a handler unwinding on abort, so
+      // the cancel is confirmed quietly instead of being reported as "handler threw during cancellation".
+      // A delivery failure above stays an ordinary `Error` — that one IS a failure.
       context.signal.addEventListener("abort", () => {
         cleanup();
-        reject(new Error("discord watch cancelled"));
+        reject(new KatariCancelledError());
       });
     });
   },
