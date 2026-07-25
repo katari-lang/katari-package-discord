@@ -12,7 +12,7 @@ importers:
         specifier: 0.1.0-rc8
         version: 0.1.0-rc8
       discord.js:
-        specifier: ^14.16.3
+        specifier: ^14.27.0
         version: 14.27.0
     devDependencies:
       '@types/node':
