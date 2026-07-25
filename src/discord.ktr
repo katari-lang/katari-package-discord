@@ -249,7 +249,10 @@ Ask in a channel whose MEMBERSHIP is the trust boundary: any member may answer, 
 COMPLETED interaction is the answer. Merely opening a form's dialog completes nothing, so a curious
 click cannot consume the question. Once answered, the controls are stripped off the message and the
 outcome left in their place, so the channel keeps a readable record and a late click has nothing to
-press.
+press. A question that ends WITHOUT an answer is stripped the same way and left reading `(expired)`:
+an expiry, a cancel or a teardown never abandons live controls in the channel for someone to press
+into nothing. Stripping is best effort either way — if the edit itself fails the stale controls stay,
+and clicking one gets Discord's own \"interaction failed\" notice.
 
 `ask` holds NO time limit, deliberately: a deadline is `time.with_deadline` wrapped around it and a
 withdrawal is `region.cancel_by_id` on the fiber holding it. One blocking question composes with

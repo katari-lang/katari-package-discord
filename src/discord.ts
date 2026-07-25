@@ -324,16 +324,20 @@ async function acknowledge(
   }
 }
 
-/** Take the controls away and leave the outcome in their place, so the channel keeps a readable record
- *  of the decision and a late click has nothing to press. Edited with the BOT token rather than through
- *  the interaction, because an interaction's token expires fifteen minutes after it was issued while a
- *  bot's edit never does — and a dialog may be submitted long after the click that opened it.
- *  Best effort, for the same reason `acknowledge` is. */
-async function stripControls(posted: Message, prompt: string, completed: string, by: string): Promise<void> {
+/** Take the controls away and leave @outcome@ in their place, so the channel keeps a readable record and
+ *  a late click has nothing to press. EVERY way a question ends comes through here — an answer, and a
+ *  cancel — because a question that has stopped mattering must stop looking answerable: live controls on
+ *  a dead ask offer nothing but the platform's bare "interaction failed".
+ *
+ *  Edited with the BOT token rather than through the interaction, because an interaction's token expires
+ *  fifteen minutes after it was issued while a bot's edit never does — and a dialog may be submitted long
+ *  after the click that opened it, while a cancel arrives with no interaction in hand at all.
+ *
+ *  Best effort, for the same reason `acknowledge` is: on the answer path a decision must not be lost to a
+ *  cosmetic edit, and on the cancel path a cosmetic edit must not break the cancel. */
+async function stripControls(posted: Message, prompt: string, outcome: string): Promise<void> {
   try {
-    // The answerer is rendered as a mention, not a raw snowflake: the channel's members are exactly who
-    // may answer, so the channel is where a name is the readable form.
-    await posted.edit({ content: `${prompt}\n→ ${completed} (by <@${by}>)`, components: [] });
+    await posted.edit({ content: `${prompt}\n→ ${outcome}`, components: [] });
   } catch {
     // The stale controls stay; clicking one gets Discord's own "interaction failed" notice.
   }
@@ -407,6 +411,9 @@ katari.agent<{ client: string; channel: string; prompt: string; controls: unknow
         if (settled) return;
         settled = true;
         cleanup();
+        // The question is over either way, so its controls come off here too — same reason as the cancel
+        // path: nothing is waiting behind them.
+        void stripControls(posted, prompt, "(failed)");
         reject(
           new KatariThrowError(
             new KatariData(discordErrorConstructor(error), { message: discordErrorMessage(error) }),
@@ -429,7 +436,9 @@ katari.agent<{ client: string; channel: string; prompt: string; controls: unknow
         settled = true;
         cleanup();
         await acknowledge(interaction);
-        await stripControls(posted, prompt, completed, interaction.user.id);
+        // The answerer is rendered as a mention, not a raw snowflake: the channel's members are exactly
+        // who may answer, so the channel is where a name is the readable form.
+        await stripControls(posted, prompt, `${completed} (by <@${interaction.user.id}>)`);
         resolve(answer);
       };
       waiters.set(posted.id, (interaction) => {
@@ -474,12 +483,20 @@ katari.agent<{ client: string; channel: string; prompt: string; controls: unknow
           control.label,
         );
       });
-      // The runtime cancelled the call (run cancel / teardown): stop listening and settle. The stale
-      // controls stay in the channel; clicking them later gets Discord's own "interaction failed" notice.
+      // The runtime cancelled the call — a `time.with_deadline` expiry, a `region.cancel_by_id`, a run
+      // teardown. Since `ask` carries no timeout of its own, a deadline around it is the RECOMMENDED
+      // composition, which makes this the ordinary way a question ends: not a failure, so it settles as a
+      // plain cancellation and never as a typed `discord_error` — there is nothing here for the program to
+      // catch. The controls still come off, because a question nobody is waiting on any more must stop
+      // looking answerable.
       context.signal.addEventListener("abort", () => {
         if (settled) return;
         settled = true;
         cleanup();
+        // Launched, not awaited: this listener is synchronous, and a cancel must not wait on a cosmetic
+        // edit (nor break on one — `stripControls` swallows its own failure). The cancel settles now and
+        // the edit lands when Discord answers it.
+        void stripControls(posted, prompt, "(expired)");
         reject(new Error("discord ask cancelled"));
       });
     });

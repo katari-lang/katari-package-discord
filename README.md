@@ -45,7 +45,9 @@ with different controls, not four agents.
 A form is two Discord steps because that is Discord's physics — text input exists only in a dialog, and
 a dialog opens only in reply to a click. Opening a dialog and closing it again completes nothing, so
 the question stays open. Once answered, the controls come off the message and the outcome is left in
-their place.
+their place — and a question that ends *without* an answer (a `time.with_deadline` expiry, a cancel, a
+teardown) is stripped the same way and left reading `(expired)`, so no dead ask leaves live controls
+behind. Stripping is best effort in both cases.
 
 Keep a `form`'s `title` to **24 characters**: that is the twin contract's bound rather than Discord's
 own (which allows 45), so a form written here renders unchanged on the Slack twin, whose dialog title
