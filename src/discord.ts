@@ -242,10 +242,67 @@ function readControl(value: unknown): Control {
   }
 }
 
+// ─── the caps the builders enforce, and what this package does with each ──────────────────────────
+
+/** What `@discordjs/builders` refuses, read off the predicates in its `dist/index.js` (1.14.1) rather
+ *  than recalled: every string this package renders goes through an `s.string()` with a maximum, and all
+ *  but the two noted below also demand at least ONE character — so a BLANK string is as fatal as a long
+ *  one. The numbers live here, next to the render, because a builder that refuses throws where the throw
+ *  can leave the interaction handler entirely, and nothing about a caption should be able to decide
+ *  whether a run survives. */
+const LIMIT = {
+  /** `buttonLabelValidator`: 1–80. A `form`'s opening button reads through here too. */
+  buttonLabel: 80,
+  /** `placeholderValidator`: at most 150, and the one string with NO minimum. */
+  selectPlaceholder: 150,
+  /** `labelValueDescriptionValidator`, applied to a select option's label AND its value: 1–100. */
+  selectOption: 100,
+  /** `titleValidator` on a modal: 1–45. */
+  modalTitle: 45,
+  /** `labelPredicate.label` on a `LabelBuilder`: 1–45 — the cap a 67-character field label broke. */
+  fieldLabel: 45,
+  /** `customIdValidator`, on every component's custom id: 1–100. */
+  customId: 100,
+  /** `valueValidator` on a text input's prefill: at most 4000, no minimum. */
+  textInputValue: 4000,
+};
+
+/** A `form`'s id has to fit its DIALOG's custom id as well, which carries `MODAL_ID_PREFIX` — so its own
+ *  bound is that much shorter than a plain control's. */
+const FORM_ID_LIMIT = LIMIT.customId - MODAL_ID_PREFIX.length;
+
+/** A COSMETIC string, made renderable. A caption, a title or a field label is presentation: a shortened
+ *  one still does its job, so it is clamped (with an ellipsis, so a developer looking at the rendered
+ *  control can see that it happened) rather than allowed to fail the question. A BLANK one is substituted
+ *  with @fallback@ — the builders' predicates demand a character and an unlabelled control is unusable
+ *  anyway — and the control's own id is both non-empty and a name the program's author will recognise. */
+function presentation(text: string, limit: number, fallback: string): string {
+  const shown = text === "" ? fallback : text;
+  return shown.length <= limit ? shown : `${shown.slice(0, limit - 1)}…`;
+}
+
+/** A LOAD-BEARING string, CHECKED rather than clamped, because shortening it would change what the
+ *  question means rather than how it looks: a custom id is how Discord routes the interaction back (two
+ *  clamped ids could collide and answer the wrong control), a select option's text is the very value
+ *  `chose` carries, and a prefill is the draft a human submits as approved — a silently docked draft
+ *  would let someone approve a document they never saw whole. An out-of-range one fails the question
+ *  instead: every call site below renders inside a `try` that raises this as the typed `api_error` a
+ *  broken question is supposed to become, so it is catchable at the katari call site and never a panic. */
+function checked(what: string, value: string, minimum: number, limit: number): string {
+  if (value.length < minimum) {
+    throw new Error(`discord ${what} is empty, and it names the value it carries`);
+  }
+  if (value.length > limit) {
+    throw new Error(`discord ${what} is ${value.length} characters; Discord allows at most ${limit}`);
+  }
+  return value;
+}
+
 /** Lay the controls out in declaration order: buttons pack into rows of five, and a dropdown takes a row
  *  of its own (Discord allows no other component beside one). A `form` contributes the BUTTON that opens
- *  its dialog, so it packs like any other button. Discord's five-row limit is left to the platform — an
- *  overflowing payload is rejected there and surfaces as `api_error`, the same as every other cap. */
+ *  its dialog, so it packs like any other button. COUNTS are left to the platform — a sixth row, a 26th
+ *  option: an overflowing payload is rejected by Discord and surfaces as `api_error`. Only the STRINGS are
+ *  handled here, because those are what a builder refuses synchronously. */
 function renderRows(controls: Control[]): ActionRowBuilder<MessageActionRowComponentBuilder>[] {
   const rows: ActionRowBuilder<MessageActionRowComponentBuilder>[] = [];
   let buttons: ButtonBuilder[] = [];
@@ -257,21 +314,34 @@ function renderRows(controls: Control[]): ActionRowBuilder<MessageActionRowCompo
   for (const control of controls) {
     if (control.kind === "select") {
       flushButtons();
-      rows.push(
-        new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
-          new StringSelectMenuBuilder()
-            .setCustomId(control.id)
-            .setPlaceholder(control.label)
-            // The option's text is both what the human reads and what comes back as `chose.option`:
-            // the answer is the option itself, so there is no second identifier to keep in step.
-            .addOptions(control.options.map((option) => ({ label: option, value: option }))),
-        ),
-      );
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId(checked("select id", control.id, 1, LIMIT.customId))
+        // The option's text is both what the human reads and what comes back as `chose.option`: the answer
+        // is the option itself, so there is no second identifier to keep in step — and therefore nothing
+        // here is presentation. Clamping an option would report a choice the program never offered.
+        .addOptions(
+          control.options.map((option) => {
+            const text = checked("select option", option, 1, LIMIT.selectOption);
+            return { label: text, value: text };
+          }),
+        );
+      // A blank placeholder is the absence of one: Discord's own default line reads better than a
+      // substituted identifier, and this is the one string whose predicate accepts no character at all.
+      if (control.label !== "") {
+        menu.setPlaceholder(presentation(control.label, LIMIT.selectPlaceholder, control.id));
+      }
+      rows.push(new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(menu));
       continue;
     }
     if (buttons.length === BUTTONS_PER_ROW) flushButtons();
+    // A `form`'s id also names its DIALOG, so it is held to the shorter bound HERE, where the question
+    // posts — rather than leaving a human to press a button whose dialog then cannot be routed back.
+    const idLimit = control.kind === "form" ? FORM_ID_LIMIT : LIMIT.customId;
     buttons.push(
-      new ButtonBuilder().setCustomId(control.id).setLabel(control.label).setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(checked("control id", control.id, 1, idLimit))
+        .setLabel(presentation(control.label, LIMIT.buttonLabel, control.id))
+        .setStyle(ButtonStyle.Primary),
     );
   }
   flushButtons();
@@ -282,19 +352,26 @@ function renderRows(controls: Control[]): ActionRowBuilder<MessageActionRowCompo
  *  a draft. */
 function renderModal(form: Control & { kind: "form" }): ModalBuilder {
   return new ModalBuilder()
-    .setCustomId(`${MODAL_ID_PREFIX}${form.id}`)
-    .setTitle(form.title)
+    .setCustomId(`${MODAL_ID_PREFIX}${checked("form id", form.id, 1, FORM_ID_LIMIT)}`)
+    .setTitle(presentation(form.title, LIMIT.modalTitle, form.id))
     .addLabelComponents(
       form.fields.map((field) => {
+        const id = checked("field id", field.id, 1, LIMIT.customId);
         const input = new TextInputBuilder()
-          .setCustomId(field.id)
+          .setCustomId(id)
           .setStyle(field.multiline ? TextInputStyle.Paragraph : TextInputStyle.Short)
           // Never required: a box left blank must still submit, so `submitted.values` reports what the
           // human actually left instead of the platform forcing text into every field.
           .setRequired(false);
         // An empty prefill is the absence of one; Discord rejects an empty `value`.
-        if (field.value !== "") input.setValue(field.value);
-        return new LabelBuilder().setLabel(field.label).setTextInputComponent(input);
+        if (field.value !== "") {
+          // Checked, never clamped: a submit means "approved AT THESE VALUES", so a draft quietly docked
+          // to fit would be approved as though it were whole.
+          input.setValue(checked("field prefill", field.value, 0, LIMIT.textInputValue));
+        }
+        return new LabelBuilder()
+          .setLabel(presentation(field.label, LIMIT.fieldLabel, id))
+          .setTextInputComponent(input);
       }),
     );
 }
@@ -390,10 +467,11 @@ katari.agent<{ client: string; channel: string; prompt: string; controls: unknow
       }
       posted = await target.send({ content: prompt, components: renderRows(rendered) });
     } catch (error) {
-      // Posting the question is the Discord API call that can fail — including when a control exceeds
-      // one of the platform's caps (a label past 80 characters, a 26th dropdown option, a sixth row):
-      // the payload is rejected here, classified and raised as the declared `discord_error` exactly as
-      // discord_send does.
+      // Rendering AND posting the question both sit inside this try, so neither a builder that refuses a
+      // control (a load-bearing string out of range) nor the platform rejecting the payload (a 26th
+      // dropdown option, a sixth row) can escape as anything but the declared `discord_error`, classified
+      // and raised exactly as discord_send does. `renderRows` belongs in here rather than above it for
+      // that reason: a builder's refusal is synchronous.
       katari.throw(new KatariData(discordErrorConstructor(error), { message: discordErrorMessage(error) }));
       // `katari.throw` never returns; the rethrow only satisfies definite assignment on `posted`.
       throw error;
@@ -476,12 +554,26 @@ katari.agent<{ client: string; channel: string; prompt: string; controls: unknow
         }
         if (!interaction.isButton()) return;
         if (control.kind === "form") {
+          // BUILDING the dialog runs `@discordjs/builders`' validators, and a builder that refuses throws
+          // SYNCHRONOUSLY — so the build must not sit as the argument of `showModal`, where no `.catch` is
+          // attached yet: the throw would leave this collector callback, and a throw that escapes an event
+          // handler settles nothing (the click does nothing, the controls stay live, the ask hangs) and on
+          // a sidecar without the port's process guard kills the process, failing every in-flight call as
+          // an uncatchable panic. Built here instead, a refusal is `fail`ed as the typed `api_error` a
+          // broken question is documented to become — including the refusals this package does not
+          // enumerate, a future discord.js check or a component count past a platform limit.
+          let dialog: ModalBuilder;
+          try {
+            dialog = renderModal(control);
+          } catch (error) {
+            fail(error);
+            return;
+          }
           // Opening the dialog IS this click's acknowledgement, and it has to land within three seconds
-          // — the collector fires as the click arrives, so there is time. A dialog Discord refuses (a
-          // form past its five-field limit, a value past 4000 characters) is the platform rejecting the
-          // payload: fail the ask as `api_error` rather than leave it waiting on an answer that this
-          // control can no longer deliver.
-          void interaction.showModal(renderModal(control)).catch(fail);
+          // — the collector fires as the click arrives, so there is time. A dialog Discord itself refuses
+          // is the platform rejecting the payload: fail the ask as `api_error` rather than leave it
+          // waiting on an answer that this control can no longer deliver.
+          void interaction.showModal(dialog).catch(fail);
           return;
         }
         void answerWith(

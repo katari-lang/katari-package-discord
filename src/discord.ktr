@@ -167,10 +167,12 @@ agent watch_messages[effect E](
 
 @"A clickable button: pressing it IS the answer (`clicked`), with no second step. @id@ returns
 verbatim, so a program branches on the id IT wrote rather than on the label a human reads — rename the
-label freely and every branch still holds. Discord caps a label at 80 characters."
+label freely and every branch still holds. Discord caps a label at 80 characters, and this package
+SHORTENS a longer one (with a trailing `…`) rather than failing the question — a caption is
+presentation, so it never decides whether an ask is askable."
 data button(
-  @"The answer's identity; returned verbatim as `clicked.id`." id: string,
-  @"What the button reads on screen." label: string,
+  @"The answer's identity; returned verbatim as `clicked.id`. At most 100 characters, and NOT shortened — it is how Discord routes the press back, so an over-long or blank one fails the ask as `api_error` instead of being silently altered into a key that could collide with a sibling's." id: string,
+  @"What the button reads on screen; at most 80 characters, shortened with `…` beyond that, and rendered as @id@ when blank." label: string,
 )
 
 @"A dropdown: picking one option IS the answer (`chose`), carrying the option's own text. Reach for it
@@ -179,18 +181,19 @@ choices is clearer as one `button` each, because then every branch has an id the
 Discord caps a dropdown at 25 options of 100 characters, and renders @label@ as the placeholder line
 shown while nothing is picked."
 data select(
-  @"The answer's identity; returned verbatim as `chose.id`." id: string,
-  @"The placeholder line shown while nothing is picked." label: string,
-  @"The options offered; the picked one returns as `chose.option`." options: array[string],
+  @"The answer's identity; returned verbatim as `chose.id`. At most 100 characters, and NOT shortened — see `button`'s @id@." id: string,
+  @"The placeholder line shown while nothing is picked; at most 150 characters, shortened with `…` beyond that. Blank leaves Discord's own default line in place." label: string,
+  @"The options offered; the picked one returns as `chose.option`. Each is 1 to 100 characters and is NOT shortened: the option's own text IS the answer, so a clamped one would report a choice the program never offered — an over-long or blank option fails the ask as `api_error`." options: array[string],
 )
 
 @"One text box of a `form`: labelled, optionally prefilled, optionally multi-line. A PREFILLED box is
 how a draft gets edited — the human reads the program's proposal and submits it changed or unchanged,
-so the program never has to guess which parts were accepted. Discord caps a value at 4000 characters."
+so the program never has to guess which parts were accepted. Discord caps a box's LABEL at 45
+characters (shortened here rather than fatal) and its @value@ at 4000 (not shortened — see below)."
 data field(
-  @"The key this box's text lands under in `submitted.values`." id: string,
-  @"What the box is labelled on screen." label: string,
-  @"The text the box starts with — a draft to edit; defaults to empty." value: string ?= "",
+  @"The key this box's text lands under in `submitted.values`. At most 100 characters, and NOT shortened — it is the key the submitted text comes back under, so an over-long or blank one fails the ask as `api_error`." id: string,
+  @"What the box is labelled on screen; at most 45 characters, shortened with `…` beyond that, and rendered as @id@ when blank." label: string,
+  @"The text the box starts with — a draft to edit; defaults to empty. At most 4000 characters and NOT shortened: a submit means \"approved AT THESE VALUES\", so a draft quietly docked to fit would be approved as though it were whole — an over-long one fails the ask as `api_error`, for the program to shorten deliberately (or to post as a file and ask about instead)." value: string ?= "",
   @"Whether the box is a multi-line paragraph rather than one line; defaults to one line." multiline: boolean ?= false,
 )
 
@@ -201,9 +204,9 @@ button reading @label@ above a dialog titled @title@. Opening the dialog and clo
 an answer: nothing was submitted, the question stays open, and any control (this one again, or a
 sibling) can still answer it. Discord takes 1 to 5 fields."
 data form(
-  @"The answer's identity; returned verbatim as `submitted.id`." id: string,
-  @"What the opening button reads on screen." label: string,
-  @"The dialog's title; keep it to 24 characters. That is the TWIN CONTRACT's bound, not Discord's own (Discord allows 45): a form written for one chat platform should render on the other, and Slack's dialog title caps at 24 — so the shared surface takes the lower of the two." title: string,
+  @"The answer's identity; returned verbatim as `submitted.id`. At most 94 characters — six shorter than any other id, because the dialog's own identifier carries a prefix — and NOT shortened; an over-long or blank one fails the ask as `api_error` where the question POSTS, before a human is asked to press anything." id: string,
+  @"What the opening button reads on screen; at most 80 characters, shortened with `…` beyond that, and rendered as @id@ when blank." label: string,
+  @"The dialog's title; keep it to 24 characters. That is the TWIN CONTRACT's bound, not Discord's own (Discord allows 45): a form written for one chat platform should render on the other, and Slack's dialog title caps at 24 — so the shared surface takes the lower of the two. Past 45 it is shortened with `…` here (Slack's twin rejects past 24 instead), and a blank title renders as @id@." title: string,
   @"The boxes the dialog presents, in order." fields: array[field],
 )
 
@@ -279,9 +282,18 @@ at-most-once rule (a catchable panic) and the posted controls go stale. That is 
 not a defect to absorb here: let the panic ride to your supervisor and ask again — whoever wanted the
 answer wants it still — rather than inventing an answer for an interaction that never landed.
 
-Raises `discord_error` when a Discord call fails: posting the question, or opening a form's dialog. A
-control past one of Discord's caps is that same failure — the platform rejects the payload, surfacing
-as `api_error` (a form's own caps show when its dialog opens, not when the question posts).
+Raises `discord_error` when a Discord call fails: posting the question, or opening a form's dialog.
+
+A control past one of Discord's caps splits two ways, and the split is what stops a cosmetic string
+from being able to break a run. PRESENTATION is CLAMPED, never fatal: a `button`'s or `form`'s @label@
+past 80 characters, a `select`'s @label@ past 150, a `form`'s @title@ past 45 and a `field`'s @label@
+past 45 are shortened with a trailing `…`, and a BLANK one renders as the control's own @id@ (blank is
+just as illegal to Discord as over-long, so it needs a substitute either way). What CARRIES MEANING is
+CHECKED instead and fails the ask as `api_error`: an @id@ (at most 100 characters, 94 for a `form` —
+it is the routing key, and two shortened ids could collide and answer the wrong control), a `select`
+option (1 to 100 — the option's text IS the answer), and a `field`'s @value@ (at most 4000 — the draft
+a human submits as approved). Whatever this package cannot check locally is still the platform
+rejecting the payload and still `api_error`: a sixth row, a 26th option, a dialog past five fields.
 
 @by@ on the answer is the answerer's raw Discord user id (a snowflake — an ENUMERABLE numeric id, not
 a name); a plain digest of an enumerable id is dictionary-reversible, so tag it with

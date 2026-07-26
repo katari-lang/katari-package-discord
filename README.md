@@ -57,11 +57,37 @@ their place — and a question that ends *without* an answer (a `time.with_deadl
 teardown) is stripped the same way and left reading `(expired)`, so no dead ask leaves live controls
 behind. Stripping is best effort in both cases.
 
+### The caps, and which of them can fail an ask
+
+Every string a control carries has a Discord cap, and the package treats it as **presentation** or as
+**load-bearing** — never as a reason to lose a run.
+
+| field | cap | over the cap, or blank |
+| --- | --- | --- |
+| `button.label`, `form.label` (the opening button) | 80 | **clamped** with a trailing `…`; blank renders as the control's `id` |
+| `select.label` (the placeholder) | 150 | **clamped**; blank leaves Discord's own default line |
+| `form.title` | 45 (keep to **24** — see below) | **clamped**; blank renders as `id` |
+| `field.label` | 45 | **clamped**; blank renders as the field's `id` |
+| `button.id`, `select.id`, `field.id` | 100 | **fails the ask** as `api_error` |
+| `form.id` | 94 (its dialog's identifier carries a prefix) | **fails the ask** as `api_error`, where the question *posts* |
+| `select.options[]` | 1–100 each, ≤25 options | **fails the ask** as `api_error` |
+| `field.value` (the prefill) | 4000 | **fails the ask** as `api_error` |
+
+A caption, a title and a label are presentation: a shortened one still does its job, and shortening is
+unconditionally better than destroying a run — so those are clamped, with the ellipsis left visible so a
+developer can see it happened. A blank one is substituted rather than clamped, because Discord rejects an
+empty string exactly as hard as an over-long one.
+
+An identifier is **not** presentation: it is how the interaction is routed back, and two clamped ids
+could collide and answer the wrong control. A `select` option is not presentation either — the option's
+own text *is* what `chose.option` carries. Nor is a `field.value`: a submit means "approved at these
+values", so a draft quietly docked to fit would be approved as though it were whole. Those fail the ask
+as a catchable `api_error` instead of being silently altered. Caps the package cannot check locally — a
+sixth row, a 26th option, a dialog past five fields — are still the platform rejecting the payload, and
+still `api_error`.
+
 Keep a `form`'s `title` to **24 characters**: that is the twin contract's bound rather than Discord's
-own (which allows 45), so a form written here renders unchanged on the Slack twin, whose dialog title
-caps at 24. Discord's other caps are its own — a button label ≤80, a dropdown of ≤25 options of ≤100
-characters, 1–5 fields per dialog, a field value ≤4000 — and exceeding one is a payload the platform
-rejects, surfacing as `api_error`.
+own 45, so a form written here renders unchanged on the Slack twin, whose dialog title caps at 24.
 
 `ask` holds **no time limit**: a deadline is `time.with_deadline` around it, a withdrawal is
 `region.cancel_by_id` on the fiber holding it. `by` is the answerer's raw Discord snowflake — an
@@ -113,6 +139,12 @@ The two packages carry the same data types with the same fields. Everything that
 - **`form.title` is capped at 24 characters** — the tighter of the two platforms' caps (Discord's own
   is 45), so a title that fits the twin fits here. Every other cap is each platform's own: Discord
   takes an ≤80-character button label and ≤25 options of ≤100 characters where Slack takes 75.
+- **Presentation is clamped here, rejected there** — Discord renders through `@discordjs/builders`,
+  whose validators run *inside this sidecar*, so an over-long caption is shortened locally (see *The
+  caps*, above). Slack posts its view to Slack's own API, so an over-cap string comes back as a typed
+  `api_error` and is not clamped. Neither side can panic on a cap; only this side will silently shorten
+  one. Stay inside the tighter Slack numbers (75-character labels and options, a 24-character title) for
+  a control that must render identically on both.
 - **`discord_error` classification** — the same two constructors as Slack's `slack_error`, but
   classified from HTTP status (401/403 → `auth_error`) rather than from Slack's error strings.
 - **Delivery guarantee** — Slack's socket acknowledges each event and re-sends an acknowledgement it
