@@ -8,7 +8,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@katari-lang/port": "0.1.0-rc8",
+    "@katari-lang/port": "0.1.0-rc10",
     "discord.js": "^14.27.0"
   },
   "devDependencies": {

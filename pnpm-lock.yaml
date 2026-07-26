@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@katari-lang/port':
-        specifier: 0.1.0-rc8
-        version: 0.1.0-rc8
+        specifier: 0.1.0-rc10
+        version: 0.1.0-rc10
       discord.js:
         specifier: ^14.27.0
         version: 14.27.0
@@ -52,11 +52,11 @@ packages:
     resolution: {integrity: sha512-wPlQDxEmlDg5IxhJPuxXr3Vy9AjYq5xCvFWGJyD7w7Np8ZGu+Mc+97LCoEc/+AYCo2IDpKioiH0/c/mj5ZR9Uw==}
     engines: {node: '>=16.11.0'}
 
-  '@katari-lang/port@0.1.0-rc8':
-    resolution: {integrity: sha512-I4dSeTxYEGorzIps8yU6rzLgzcHY15hcgR2vgUo659gzGMBY37EiL2Hh6Sjoa3mil76StqzvTMqIPH0LV/zlvA==}
+  '@katari-lang/port@0.1.0-rc10':
+    resolution: {integrity: sha512-GKLolfiT/B+dHfZYwdg/w2osZGNQSU5FrJe27+MFDiFOHfBUswkw3nZ/ix0BN73b7mvVtbZtL6WYLcOtK8egUw==}
 
-  '@katari-lang/types@0.1.0-rc8':
-    resolution: {integrity: sha512-0z4T7qQl0AxBWVsq/cde52Zg8XCSOE9R1KLJrDn6WRf4q2vjsVUYF1MNr8Q9oQMe9HcLA3lyIrMSGFfpDcJ2HQ==}
+  '@katari-lang/types@0.1.0-rc10':
+    resolution: {integrity: sha512-Ou1lBd2oE/D8fPHVcb63mJ8S4I8P1InoOBiB+KhMTsdFqI79DRug+7fav0dHMEXwPJfuPxTMFj8edHqa7RcpAQ==}
 
   '@sapphire/async-queue@1.5.5':
     resolution: {integrity: sha512-cvGzxbba6sav2zZkH8GPf2oGk9yYoD5qrNWdu9fRehifgnFZJMV+nuy2nON2roRO4yQQ+v7MK/Pktl/HgfsUXg==}
@@ -180,11 +180,11 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  '@katari-lang/port@0.1.0-rc8':
+  '@katari-lang/port@0.1.0-rc10':
     dependencies:
-      '@katari-lang/types': 0.1.0-rc8
+      '@katari-lang/types': 0.1.0-rc10
 
-  '@katari-lang/types@0.1.0-rc8': {}
+  '@katari-lang/types@0.1.0-rc10': {}
 
   '@sapphire/async-queue@1.5.5': {}
 
