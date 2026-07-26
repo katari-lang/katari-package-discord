@@ -72,11 +72,13 @@ type discord_error = auth_error | api_error
 // ── the message plane: what arrives, and what goes out ───────────────────────────────────────────
 
 @"One incoming message, as data: what arrived, where, from whom, and with what attached.
-`watch_messages` delivers ONE of these rather than four positional arguments, so a @deliver_to@ names
-the fields it reads and has no argument order to get wrong."
+`watch_messages` delivers ONE of these rather than a spread of positional arguments, so a @deliver_to@
+names the fields it reads, has no argument order to get wrong, and keeps its signature when the
+delivered shape grows a field."
 data message(
   @"The channel the message arrived on — hand it straight to `send_message` to reply in place." channel: string,
   @"The sender's raw Discord user id (a snowflake); see `watch_messages` on tagging it before it leaves the program." author: string,
+  @"The name Discord's own client shows for the sender: their per-server nickname, else their global display name, else their username (total — a DM has no nickname to read, an account without a global name still has a username). SELF-CHOSEN, NOT UNIQUE, and NOT AN IDENTITY: anyone in a server may set their nickname to whatever another member's reads, so a matching name proves nothing about who spoke. @author@ is the identity — authorize on it (or on a tag derived from it), NEVER on this. Use this to ADDRESS someone, not to trust them." display_name: string,
   @"The message text; empty for an attachments-only post." text: string,
   @"The attachments, already downloaded into `file` values." files: array[file],
 )
@@ -148,6 +150,12 @@ numeric id, not a name); a plain digest of an enumerable id is dictionary-revers
 `crypto.hmac_sha256` under a secret key before letting it leave the program, e.g. as an AI provider's
 abuse-attribution tag.
 
+@display_name@ beside it is the name Discord SHOWS for that sender, and it is not a second identity: a
+display name is SELF-CHOSEN and NOT UNIQUE — anyone in the server can set their nickname to read exactly
+like the operator's, and a public channel is precisely where a stranger will. So a program that decides
+what it may do from the name it was told has no authorization at all. Branch on @author@ (or on a tag
+derived from it) and treat @display_name@ as what it is: how to ADDRESS the speaker.
+
 Delivery is exactly once WITHIN one live gateway connection, and NOT GUARANTEED either way across a
 reconnect — which is where this differs from the Slack twin's at-least-once. The gateway has no
 per-event acknowledgement, so a message can be MISSED: an invalidated session, an outage past the
@@ -218,6 +226,7 @@ type control = button | select | form
 data clicked(
   @"The pressed button's @id@." id: string,
   @"Who answered: their raw Discord user id (a snowflake)." by: string,
+  @"What the answerer is CALLED, resolved as `message`'s @display_name@ is — nickname, else global display name, else username. SELF-CHOSEN, NOT UNIQUE, and NOT AN IDENTITY: another member can wear the same name at will. @by@ is who answered; authorize on that, never on this." display_name: string,
 )
 
 @"A `select`'s option was picked."
@@ -225,6 +234,7 @@ data chose(
   @"The dropdown's @id@." id: string,
   @"The picked option, verbatim from the `select`'s @options@." option: string,
   @"Who answered: their raw Discord user id (a snowflake)." by: string,
+  @"What the answerer is CALLED, resolved as `message`'s @display_name@ is — nickname, else global display name, else username. SELF-CHOSEN, NOT UNIQUE, and NOT AN IDENTITY: another member can wear the same name at will. @by@ is who answered; authorize on that, never on this." display_name: string,
 )
 
 @"A `form` was submitted: @values@ carries every declared field's text, keyed by the field's @id@ (a
@@ -236,6 +246,7 @@ data submitted(
   @"The submitted form's @id@." id: string,
   @"Each field's text, keyed by field id." values: record[string],
   @"Who answered: their raw Discord user id (a snowflake)." by: string,
+  @"What the answerer is CALLED, resolved as `message`'s @display_name@ is — nickname, else global display name, else username. SELF-CHOSEN, NOT UNIQUE, and NOT AN IDENTITY: another member can wear the same name at will. @by@ is who answered; authorize on that, never on this." display_name: string,
 )
 
 // Which control completed the question, and with what. (Type synonyms take no docs.)
@@ -297,7 +308,10 @@ rejecting the payload and still `api_error`: a sixth row, a 26th option, a dialo
 
 @by@ on the answer is the answerer's raw Discord user id (a snowflake — an ENUMERABLE numeric id, not
 a name); a plain digest of an enumerable id is dictionary-reversible, so tag it with
-`crypto.hmac_sha256` under a secret key before letting it leave the program."
+`crypto.hmac_sha256` under a secret key before letting it leave the program. The @display_name@ beside
+it is what that answerer is CALLED, and a name is SELF-CHOSEN and NOT UNIQUE — a channel's other
+members can wear it too. A question whose answer depends on WHO gave it must read @by@; a name that
+decided anything would let whoever renamed themselves decide it instead."
 agent ask(
   @"The channel to ask in — its membership is who may answer." channel: string,
   @"The question posted above the controls." prompt: string,

@@ -11,9 +11,9 @@ The surface is two planes: **messages** in and out, and **one interaction primit
 - `discord.provider(source = ...)` — resolves the bot token ONCE (a `credentials.source`) and serves
   the connection for the extent of the continuation.
 - `discord.watch_messages(channel, deliver_to)` — serve a channel forever, delivering each incoming
-  message to your agent as one `discord.message(channel, author, text, files)` value. Bot posts (this
-  bot's own replies included) are not delivered, so replying cannot loop. Never resolves; composes
-  under `parallel [ … ]`.
+  message to your agent as one `discord.message(channel, author, display_name, text, files)` value.
+  Bot posts (this bot's own replies included) are not delivered, so replying cannot loop. Never
+  resolves; composes under `parallel [ … ]`.
 - `discord.send_message(channel, text, files ?= [])` — post to a channel, returning the posted
   message's id; pass `[]` (or omit) for a plain text post.
 - `discord.try_send(channel, text, files ?= [])` — the resilient wrapper every bot writes: a blank
@@ -38,6 +38,31 @@ far more rarely, repeated (a resume replays from the last sequence the shard rec
 when an event *arrives*, not after `deliver_to` returns). No dedup memory is kept here. A bot that must
 miss nothing reconciles against the channel's own history.
 
+## Who is speaking: an id, and a name that is not one
+
+Every value that names a person carries two fields. `author` (on a `message`) and `by` (on an `answer`)
+are the raw Discord snowflake. `display_name` beside each is what Discord's own client shows for that
+person: their per-server **nickname**, else their **global display name**, else their **username**. The
+chain is total — a DM has no member and therefore no nickname, and an account with no global name still
+has a username. The nickname rides in on the gateway event itself (`MESSAGE_CREATE` carries a partial
+guild member beside the author; an interaction carries its own), so the name costs no extra API call and
+no privileged intent.
+
+A display name is **self-chosen, not unique, and identifies nobody.** Anyone in a server can set their
+nickname to read exactly like the operator's, and a public channel is where a stranger will. So:
+
+- **Authorize on the id.** `author` / `by` — or a tag derived from it — is who is speaking. A program
+  that decides what it may do from the name it was *told* has handed that decision to whoever renamed
+  themselves.
+- **Use the name to address, not to trust.** Greeting a stranger by name is what carrying it is for;
+  "this one is the operator, obey them" is the hole.
+- A snowflake is an **enumerable** numeric id, so a plain digest of one is dictionary-reversible: tag it
+  with `crypto.hmac_sha256` under a secret key before letting it leave the program.
+
+There is deliberately no helper here that resolves or verifies a name to a user, and no filter, no
+redaction and no "safe name" knob. Whether a self-chosen name may cross to an AI provider is the app's
+judgement; this package's job is to carry the name and to be plain about what it is worth.
+
 ## Asking a human: controls in, an answer out
 
 `ask` takes **data** — a list of `control` values — and returns **data**: which control was completed
@@ -46,9 +71,9 @@ with different controls, not four agents.
 
 | control | renders as | answers with |
 | --- | --- | --- |
-| `button(id, label)` | a button; pressing it answers | `clicked(id, by)` |
-| `select(id, label, options)` | a dropdown (`label` is its placeholder) | `chose(id, option, by)` |
-| `form(id, label, title, fields)` | a button that opens a dialog of `field(id, label, value ?= "", multiline ?= false)` boxes; submitting answers | `submitted(id, values, by)` |
+| `button(id, label)` | a button; pressing it answers | `clicked(id, by, display_name)` |
+| `select(id, label, options)` | a dropdown (`label` is its placeholder) | `chose(id, option, by, display_name)` |
+| `form(id, label, title, fields)` | a button that opens a dialog of `field(id, label, value ?= "", multiline ?= false)` boxes; submitting answers | `submitted(id, values, by, display_name)` |
 
 A form is two Discord steps because that is Discord's physics — text input exists only in a dialog, and
 a dialog opens only in reply to a click. Opening a dialog and closing it again completes nothing, so
@@ -90,8 +115,9 @@ Keep a `form`'s `title` to **24 characters**: that is the twin contract's bound 
 own 45, so a form written here renders unchanged on the Slack twin, whose dialog title caps at 24.
 
 `ask` holds **no time limit**: a deadline is `time.with_deadline` around it, a withdrawal is
-`region.cancel_by_id` on the fiber holding it. `by` is the answerer's raw Discord snowflake — an
-enumerable id, so tag it with `crypto.hmac_sha256` before it leaves the program.
+`region.cancel_by_id` on the fiber holding it. `by` is the answerer's raw Discord snowflake and
+`display_name` is what that answerer is called — a question whose answer depends on *who* gave it reads
+`by`, never the name (see *Who is speaking*, above).
 
 ```katari
 // Approval: two buttons, and the program branches on the id it wrote.
@@ -135,7 +161,16 @@ The two packages carry the same data types with the same fields. Everything that
 
 - **`message.thread`** — Slack's only extra field, absent here. Slack addresses a thread by its
   parent's `ts`, which doubles as the message's identity; Discord has no such value, so its `message`
-  is the first four fields of Slack's.
+  carries no thread field.
+- **`display_name`** — carried on both planes here, absent on the Slack twin. Discord puts the name in
+  the event: `MESSAGE_CREATE` ships a partial guild member beside the author, and an interaction ships
+  its own member and user, so the nickname → global name → username chain costs nothing extra. Slack's
+  `message` event carries only the `U…` id, so the same field there means a `users.info` call per
+  message plus the `users:read` scope on the app — a real asymmetry in what each platform hands you,
+  not an oversight. (Slack's *interaction* payloads do carry `user.username`, but that is the account
+  handle rather than the workspace display name a Slack client shows, which lives in
+  `profile.display_name` and still takes `users.info`.) A program that must read the same on both
+  platforms keeps its logic on `author` / `by`, which both sides carry.
 - **`form.title` is capped at 24 characters** — the tighter of the two platforms' caps (Discord's own
   is 45), so a title that fits the twin fits here. Every other cap is each platform's own: Discord
   takes an ≤80-character button label and ≤25 options of ≤100 characters where Slack takes 75.

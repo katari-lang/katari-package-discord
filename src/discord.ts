@@ -27,6 +27,7 @@ import {
   ComponentType,
   Events,
   GatewayIntentBits,
+  GuildMember,
   LabelBuilder,
   type Message,
   type MessageActionRowComponentBuilder,
@@ -65,6 +66,37 @@ function discordErrorMessage(error: unknown): string {
 function discordErrorConstructor(error: unknown): string {
   const status = property(error, "status");
   return status === 401 || status === 403 ? "discord.auth_error" : "discord.api_error";
+}
+
+/** The name Discord's own client shows for a person, resolved the way that client resolves it: the
+ *  per-server nickname where they set one, else the account's global display name, else the username.
+ *  The chain is TOTAL because its last link is `username`, which every account has — so a DM, where
+ *  there is no guild member and therefore no nickname at all, still names its sender.
+ *
+ *  What the name is NOT is decided at the katari boundary rather than here: it is self-chosen and
+ *  non-unique, so the id travels beside it and stays the identity. This function only resolves; the
+ *  program decides what a name may be used for. */
+function displayNameOf(
+  nickname: string | null,
+  user: { globalName: string | null; username: string },
+): string {
+  return nickname ?? user.globalName ?? user.username;
+}
+
+/** The per-server nickname on an interaction's member, or null when there is none — a DM carries no
+ *  member at all, and a member may simply not have set one.
+ *
+ *  Both member shapes are read because discord.js hands over EITHER its own `GuildMember` (when the
+ *  guild is cached) or the raw `APIInteractionGuildMember` the gateway sent (when it is not), and the
+ *  two spell the same field differently: `nickname` on the class, `nick` on the wire payload. Reading
+ *  only the cached spelling would silently fall back to the global name for anyone in an uncached
+ *  guild, which reads as "they have no nickname" rather than as the miss it is. */
+function interactionNickname(
+  interaction: MessageComponentInteraction | ModalSubmitInteraction,
+): string | null {
+  const member = interaction.member;
+  if (member === null) return null;
+  return member instanceof GuildMember ? member.nickname : (member.nick ?? null);
 }
 
 /** A filename for an attachment payload: Discord requires one; derive the extension from the MIME
@@ -536,6 +568,7 @@ katari.agent<{ client: string; channel: string; prompt: string; controls: unknow
             id: control.id,
             values: submittedValues(interaction, control),
             by: interaction.user.id,
+            display_name: displayNameOf(interactionNickname(interaction), interaction.user),
           }),
           control.label,
         );
@@ -547,7 +580,12 @@ katari.agent<{ client: string; channel: string; prompt: string; controls: unknow
           const option = interaction.values[0] ?? "";
           void answerWith(
             interaction,
-            new KatariData("discord.chose", { id: control.id, option, by: interaction.user.id }),
+            new KatariData("discord.chose", {
+              id: control.id,
+              option,
+              by: interaction.user.id,
+              display_name: displayNameOf(interactionNickname(interaction), interaction.user),
+            }),
             option,
           );
           return;
@@ -578,7 +616,11 @@ katari.agent<{ client: string; channel: string; prompt: string; controls: unknow
         }
         void answerWith(
           interaction,
-          new KatariData("discord.clicked", { id: control.id, by: interaction.user.id }),
+          new KatariData("discord.clicked", {
+            id: control.id,
+            by: interaction.user.id,
+            display_name: displayNameOf(interactionNickname(interaction), interaction.user),
+          }),
           control.label,
         );
       });
@@ -612,7 +654,10 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
     const connection = connectionOf(client);
     return new Promise<never>((_resolve, reject) => {
       const listener = (message: {
-        author: { bot: boolean; id: string };
+        author: { bot: boolean; id: string; globalName: string | null; username: string };
+        // `Message.member` is the guild member the author is in the channel's server, and null in a DM
+        // — where there is no server to hold a nickname. The chain below is total without it.
+        member: { nickname: string | null } | null;
         channelId: string;
         content: string;
         attachments: Map<string, { url: string; contentType: string | null }>;
@@ -643,6 +688,10 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
               // The raw snowflake; the Katari side decides whether and how to hash it before it
               // leaves the program.
               author: message.author.id,
+              // The name beside the id, so an app CAN address a sender rather than only correlate
+              // them. Carried, never judged: whether a self-chosen name may cross to an AI provider
+              // is the app's call, and the type's doc is where it is told the name identifies nobody.
+              display_name: displayNameOf(message.member?.nickname ?? null, message.author),
               text: message.content,
               files,
             }),

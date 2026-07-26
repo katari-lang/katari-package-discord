@@ -1,6 +1,6 @@
 [package]
 name = "discord"
-version = "0.2.2"
+version = "0.3.0"
 description = "A discord.js gateway client for Katari: a connection provider, the message plane (watch / send, with files in both directions), and `ask` — one blocking question that presents its controls as data and returns the answer as data. Ships an FFI sidecar (discord.ts)."
 
 [runtime]
