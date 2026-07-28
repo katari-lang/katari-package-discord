@@ -5,7 +5,8 @@
   "type": "module",
   "description": "FFI sidecar dependencies for the Katari `discord` package (src/discord.ts).",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/check-limits.mjs"
   },
   "dependencies": {
     "@katari-lang/port": "0.1.0-rc10",

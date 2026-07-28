@@ -116,6 +116,42 @@ function attachmentName(contentType: string | undefined, index: number): string 
   return `file-${index + 1}.${extension}`;
 }
 
+/** Whether `bytes` carries `signature` at `offset` — the one comparison every magic number below is
+ *  made of. */
+function matchesSignature(bytes: Uint8Array, offset: number, signature: number[]): boolean {
+  return (
+    bytes.length >= offset + signature.length &&
+    signature.every((byte, index) => bytes[offset + index] === byte)
+  );
+}
+
+/** The content type the BYTES prove, or undefined when they prove nothing. Discord types an
+ *  attachment by its filename EXTENSION and never reads the bytes, so its `contentType` is exactly
+ *  as true as the uploader's filename: a PNG saved as `photo.webp` arrives declared `image/webp`.
+ *  An AI provider downstream checks the actual bytes against the declared media type and rejects
+ *  the whole request on a mismatch — a rejection the conversation then repeats on every later call,
+ *  because history is re-sent whole. The bytes are already in hand at the download, so proving the
+ *  type here costs nothing and corrects the record once, for every consumer.
+ *
+ *  The signatures are the unmistakable AND consequential ones — the four image types providers
+ *  inline plus PDF, the exact set whose declared media type is byte-checked against the content.
+ *  Anything else keeps Discord's word: a text file has no magic number, and a wrong text subtype is
+ *  not byte-checked by anyone. */
+function sniffedContentType(bytes: Uint8Array): string | undefined {
+  if (matchesSignature(bytes, 0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "image/png";
+  if (matchesSignature(bytes, 0, [0xff, 0xd8, 0xff])) return "image/jpeg";
+  if (matchesSignature(bytes, 0, [0x47, 0x49, 0x46, 0x38])) return "image/gif"; // "GIF8"
+  // "RIFF" alone is a container family (WAV shares it); the "WEBP" tag at offset 8 is the image.
+  if (
+    matchesSignature(bytes, 0, [0x52, 0x49, 0x46, 0x46]) &&
+    matchesSignature(bytes, 8, [0x57, 0x45, 0x42, 0x50])
+  ) {
+    return "image/webp";
+  }
+  if (matchesSignature(bytes, 0, [0x25, 0x50, 0x44, 0x46])) return "application/pdf"; // "%PDF"
+  return undefined;
+}
+
 katari.agent<{ token: string }>("create_discord_client", async ({ token }) => {
   const client = new Client({
     intents: [
@@ -281,7 +317,12 @@ function readControl(value: unknown): Control {
  *  but the two noted below also demand at least ONE character — so a BLANK string is as fatal as a long
  *  one. The numbers live here, next to the render, because a builder that refuses throws where the throw
  *  can leave the interaction handler entirely, and nothing about a caption should be able to decide
- *  whether a run survives. */
+ *  whether a run survives.
+ *
+ *  EVERY NUMBER HERE IS ALSO PUBLISHED FROM KATARI, by `discord.limits()` in `discord.ktr`, so a program
+ *  can check its own controls (`discord.check_controls`) without a connection. Nothing in Katari can read
+ *  a constant out of this file, so the two copies are kept equal by `scripts/check-limits.mjs`, which
+ *  fails when they disagree: change a number here and change it there, or the check says so. */
 const LIMIT = {
   /** `buttonLabelValidator`: 1–80. A `form`'s opening button reads through here too. */
   buttonLabel: 80,
@@ -459,6 +500,35 @@ async function stripControls(posted: Message, prompt: string, outcome: string): 
   }
 }
 
+/** The controls of one question, keyed by the id an interaction comes back carrying — FIRST wins, and
+ *  a repeat is ANNOUNCED.
+ *
+ *  Two controls sharing an id cannot be told apart on the way back: Discord returns the custom id and
+ *  nothing else, so whichever entry this map holds answers for both. Built the obvious way
+ *  (`new Map(controls.map(…))`) the LAST one silently wins, which is the worst of the three possible
+ *  behaviours — a human presses "deny" and the program is told "approve", with nothing anywhere saying
+ *  so. Keeping the first at least makes the outcome match declaration order, and the warning turns a
+ *  silent mis-route into something a developer can find in a log.
+ *
+ *  It cannot be FIXED here — one of the two controls is unroutable whatever this does — which is why
+ *  `discord.check_controls` exists: it refuses the same list as a value, purely, where the controls are
+ *  built and long before a human is asked to press one. */
+function controlsById(controls: Control[]): Map<string, Control> {
+  const byId = new Map<string, Control>();
+  for (const control of controls) {
+    if (byId.has(control.id)) {
+      console.warn(
+        `discord_ask: two controls share the id ${JSON.stringify(control.id)} — Discord carries back` +
+          ` only the id, so the FIRST one keeps it and completing the later one would answer as the` +
+          ` first. Check the controls with discord.check_controls where they are built.`,
+      );
+      continue;
+    }
+    byId.set(control.id, control);
+  }
+  return byId;
+}
+
 /** Called with each dialog submit that arrived for one open question. */
 type ModalWaiter = (interaction: ModalSubmitInteraction) => void;
 
@@ -513,7 +583,7 @@ katari.agent<{ client: string; channel: string; prompt: string; controls: unknow
     // deliberately takes no `max`, because clicking is not answering: opening a form's dialog and closing
     // it again completes nothing, so the question has to stay open for the next attempt.
     return new Promise<KatariData<Record<string, unknown>>>((resolve, reject) => {
-      const byId = new Map(rendered.map((control) => [control.id, control]));
+      const byId = controlsById(rendered);
       const waiters = modalWaitersOf(connection);
       const collector = posted.createMessageComponentCollector();
       let settled = false;
@@ -672,11 +742,14 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
           for (const attachment of message.attachments.values()) {
             const response = await fetch(attachment.url);
             if (!response.ok) continue;
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            // The bytes' own word beats Discord's extension-derived claim; the claim stands only
+            // where the bytes prove nothing. A sniffed type also fills a NULL claim, so a proxied
+            // upload Discord never typed classifies as the image it is instead of as opaque bytes.
+            const contentType = sniffedContentType(bytes) ?? attachment.contentType ?? undefined;
             files.push(
-              await context.file(new Uint8Array(await response.arrayBuffer()), {
-                ...(attachment.contentType === null
-                  ? {}
-                  : { contentType: attachment.contentType }),
+              await context.file(bytes, {
+                ...(contentType === undefined ? {} : { contentType }),
               }),
             );
           }
