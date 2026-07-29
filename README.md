@@ -16,7 +16,7 @@ three pure-or-nearly-pure helpers that need no connection at all.
 - `discord.watch_messages(channel, deliver_to)` — serve a channel forever, delivering each incoming
   message to your agent as one `discord.message(channel, author, display_name, text, files)` value.
   Bot posts (this bot's own replies included) are not delivered, so replying cannot loop. Never
-  resolves; composes under `parallel [ … ]`.
+  resolves; composes under `parallel [ … ]`. The callback's own argument is named `value` (0.6.0).
 - `discord.send_message(channel, text, files ?= [])` — post to a channel, returning the posted
   message's id; pass `[]` (or omit) for a plain text post.
 - `discord.try_send(channel, text, files ?= []) -> delivered | dropped(reason)` — the resilient
@@ -32,8 +32,22 @@ three pure-or-nearly-pure helpers that need no connection at all.
 - `discord.check_controls(controls) -> valid | invalid(reason)` — is this question askable, as a
   **pure** value: counts, ids (including **duplicates**, which nothing else catches), and every string
   length. Run it where the controls are built, not where they are asked.
+- `discord.fit_message(text, marker) -> string` — shorten text to fit one message, ending it with your
+  own marker when anything was cut. **Pure**; the room is the cap *minus* the marker, which is the half
+  of the job that is arithmetic rather than editorial.
 - `discord.author_tag(source, author, length ?= 8) -> string` — the keyed pseudonym for a speaker's
   snowflake, so a user id can reach a model or a log without being a user id.
+
+## Breaking changes in 0.6.0
+
+- **`watch_messages`'s `deliver_to` is called with `value`, not `message`.** Argument names are
+  structural in Katari, so a callback declared `(message: discord.message)` no longer type-checks here.
+  Rename its parameter to `value` — the type is unchanged — and `deliver_to = handler` keeps working.
+  The reason is the ecosystem, not this package: `gmail.watch` and `poll.subscribe` name theirs `value`
+  after the prelude's primary-argument convention, and the two chat twins were the only holdouts, so
+  one agent could not be handed to a mail watch and a channel watch without an adapter that renamed a
+  single word. The Slack twin made the same change in its 0.4.0.
+- New: `fit_message`. Nothing else moved.
 
 Files are first-class in both directions: an incoming message's attachments arrive as `file` values
 (the sidecar downloads each from Discord's CDN and uploads it over the blob side channel), and
@@ -80,8 +94,13 @@ judgement; this package's job is to carry the name and to be plain about what it
 ### `author_tag` — the speaker, pseudonymised
 
 ```katari
-let tag = discord.author_tag(source = credentials.env(key = "DISCORD_TOKEN"), author = message.author)
-// → "5b31f5f5" — eight hex characters, stable per key, meaningless without it
+import discord
+
+agent tag_of(message: discord.message) -> string with io | prelude.throw[env.missing_secret | oauth.server_error] {
+  let tag = discord.author_tag(source = credentials.env(key = "DISCORD_TOKEN"), author = message.author)
+  // → "5b31f5f5" — eight hex characters, stable per key, meaningless without it
+  tag
+}
 ```
 
 `author_tag(source, author, length ?= 8)` is `crypto.hmac_sha256` under a **named** key, sliced to
@@ -169,10 +188,17 @@ Every number above is published as data by `discord.limits()`, and `discord.chec
 reads them to answer one question — *is this askable?* — as a **value**:
 
 ```katari
-let controls = [discord.button(id = "approve", label = "approve"), discord.button(id = "deny", label = "deny")]
-match (discord.check_controls(controls = controls)) {
-  case discord.valid() -> discord.ask(channel = channel, prompt = prompt, controls = controls)
-  case discord.invalid(reason => reason) -> refuse_to_open_the_gate(why = reason)
+import discord
+
+data gate_unaskable(reason: string)
+agent refuse_to_open_the_gate(why: string) -> never with prelude.throw[gate_unaskable] { prelude.throw(error = gate_unaskable(reason = why)) }
+
+agent open_the_gate(channel: string, prompt: string) -> discord.answer with discord.connection | io | prelude.throw[discord.discord_error | gate_unaskable] {
+  let controls = [discord.button(id = "approve", label = "approve"), discord.button(id = "deny", label = "deny")]
+  match (discord.check_controls(controls = controls)) {
+    case discord.valid() -> discord.ask(channel = channel, prompt = prompt, controls = controls)
+    case discord.invalid(reason => reason) -> refuse_to_open_the_gate(why = reason)
+  }
 }
 ```
 
@@ -182,6 +208,28 @@ message, so its text is bound by `limits().message_text` (2000) — but the prom
 brief, a stranger's message) has to bound that text itself against that number. Past it Discord refuses
 the post, which means the question cannot be asked at all, which — for anything shaped like an approval
 gate — means the action can never be approved however often it is retried.
+
+`discord.fit_message(text, marker)` is that bounding, packaged:
+
+```katari
+import discord
+
+agent gate_prompt(headline: string, draft: string) -> string {
+  let prompt = discord.fit_message(
+    text = f"${headline}\n\n${draft}",
+    marker = "\n… (cut to fit one Discord message — ask for the rest)",
+  )
+  prompt
+}
+```
+
+The room is `message_text` **minus the marker's own length**, because the marker is posted too —
+measuring the text, cutting it to the cap and appending afterwards is the way this is got wrong, and it
+lands back over the cap every time. Text that already fits comes back unchanged, so it is safe to wrap
+around everything. The marker is *yours* because only you know what the reader needs told, and something
+must be told: text silently docked reads exactly like text that ended, and a model reading it will
+answer from a fragment as though it had the whole. Write it as the fact ("the first 1,900 of 7,400
+characters"), not as a bare ellipsis.
 
 Both are **pure** — no connection, no `io`, nothing to catch — so they belong where the controls are
 *built* (a gate's constructor, a test), which is the only place worth spending a check. `invalid` carries
@@ -221,30 +269,41 @@ character or two of its cap should be shortened rather than argued about.
 `by`, never the name (see *Who is speaking*, above).
 
 ```katari
+import discord
+
+@"What the approval gates." request do_it() -> null
+@"…and what stands in for it when the answer was anything else." request skip() -> null
+@"Send the mail AT THE VALUES that came back." request send(values: record[string]) -> null
+@"…and what stands in for it when the operator denied." request refuse() -> null
+
 // Approval: two buttons, and the program branches on the id it wrote.
-match (discord.ask(
-  channel = channel,
-  prompt = f"Approve: ${what}?",
-  controls = [discord.button(id = "approve", label = "approve"), discord.button(id = "deny", label = "deny")],
-)) {
-  case discord.clicked(id => "approve", by => _) -> do_it()
-  case rest -> skip()
+agent approve(channel: string, what: string) -> null with discord.connection | do_it | skip | io | prelude.throw[discord.discord_error] {
+  match (discord.ask(
+    channel = channel,
+    prompt = f"Approve: ${what}?",
+    controls = [discord.button(id = "approve", label = "approve"), discord.button(id = "deny", label = "deny")],
+  )) {
+    case discord.clicked(id => "approve", by => _) -> do_it()
+    case rest -> skip()
+  }
 }
 
 // Editing a draft: a PREFILLED form beside a deny button. A submit is approval AT THOSE VALUES.
-match (discord.ask(
-  channel = channel,
-  prompt = "Send this mail? Edit and submit to send, or deny.",
-  controls = [
-    discord.form(id = "send", label = "edit & send", title = "mail draft", fields = [
-      discord.field(id = "subject", label = "subject", value = subject),
-      discord.field(id = "body", label = "body", value = body, multiline = true),
-    ]),
-    discord.button(id = "deny", label = "deny"),
-  ],
-)) {
-  case discord.submitted(id => _, values => values, by => _) -> send(values = values)
-  case rest -> refuse()
+agent confirm_draft(channel: string, subject: string, body: string) -> null with discord.connection | send | refuse | io | prelude.throw[discord.discord_error] {
+  match (discord.ask(
+    channel = channel,
+    prompt = "Send this mail? Edit and submit to send, or deny.",
+    controls = [
+      discord.form(id = "send", label = "edit & send", title = "mail draft", fields = [
+        discord.field(id = "subject", label = "subject", value = subject),
+        discord.field(id = "body", label = "body", value = body, multiline = true),
+      ]),
+      discord.button(id = "deny", label = "deny"),
+    ],
+  )) {
+    case discord.submitted(id => _, values => values, by => _) -> send(values = values)
+    case rest -> refuse()
+  }
 }
 ```
 
@@ -258,42 +317,23 @@ mention; the `by` the `answer` carries is the raw id.
 
 ## Divergences from the slack twin
 
-The two packages carry the same data types with the same fields. Everything that differs is here:
+**The complete list lives in one place: the
+[slack package's README](https://github.com/katari-lang/katari-package-slack#divergences-from-the-discord-twin),
+under *Divergences*.** It is not repeated here, and that is the point — it used to be, in three places (this
+file, the slack README, and the `slack.ktr` header), and all three had drifted apart into three
+different lists by the time anyone compared them.
 
-- **`message.thread`** — Slack's only extra field, absent here. Slack addresses a thread by its
-  parent's `ts`, which doubles as the message's identity; Discord has no such value, so its `message`
-  carries no thread field.
-- **`display_name`** — carried on both planes here, absent on the Slack twin. Discord puts the name in
-  the event: `MESSAGE_CREATE` ships a partial guild member beside the author, and an interaction ships
-  its own member and user, so the nickname → global name → username chain costs nothing extra. Slack's
-  `message` event carries only the `U…` id, so the same field there means a `users.info` call per
-  message plus the `users:read` scope on the app — a real asymmetry in what each platform hands you,
-  not an oversight. (Slack's *interaction* payloads do carry `user.username`, but that is the account
-  handle rather than the workspace display name a Slack client shows, which lives in
-  `profile.display_name` and still takes `users.info`.) A program that must read the same on both
-  platforms keeps its logic on `author` / `by`, which both sides carry.
-- **`form.title` is *asked for* at 24 characters** — the tighter of the two platforms' caps, as a
-  convention rather than a cap: this side clamps at Discord's own 45 and only Slack's twin refuses past
-  24, so a title kept to 24 fits both. Every other cap is each platform's own: Discord takes an
-  ≤80-character button label and ≤25 options of ≤100 characters where Slack takes 75.
-- **Presentation is clamped here, rejected there** — Discord renders through `@discordjs/builders`,
-  whose validators run *inside this sidecar*, so an over-long caption is shortened locally (see *The
-  caps*, above). Slack posts its view to Slack's own API, so an over-cap string comes back as a typed
-  `api_error` and is not clamped. Neither side can panic on a cap; only this side will silently shorten
-  one — which is what `check_controls` is for, since a clamp that nobody is told about is a label that
-  reads as most of a sentence. Stay inside the tighter Slack numbers (75-character labels and options, a
-  24-character title) for a control that must render identically on both.
-- **`discord_error` classification** — the same two constructors as Slack's `slack_error`, but
-  classified from HTTP status (401/403 → `auth_error`) rather than from Slack's error strings.
-- **Delivery guarantee** — Slack's socket acknowledges each event and re-sends an acknowledgement it
-  lost, so that side is **at-least-once**. Discord's gateway acknowledges nothing per event, so this
-  side guarantees **neither** across a reconnect: a message may be missed, and far more rarely
-  repeated (see *Delivery*, above). A program that needs one uniform guarantee across both must
-  supply it itself.
+What keeps that one list honest is `slack/scripts/check-twin.mjs` (`pnpm test` in the slack package):
+it reads *both* modules and compares every published name, every data field, every agent argument and
+every callback's argument names. A shape one twin grows without the other fails the check until it is
+either given to the other or **declared as a divergence, with a reason** — and those declarations are
+what the slack README's table narrates. A number that differs is reported the same way: the script
+prints the *portable envelope*, the tighter of each `limits()` pair, which is what a control rendering
+on both platforms must fit.
 
-Form validation is *not* on that list, deliberately: both sides make every input optional and both
-return `values` total over the declared fields, with a blank box as `""`. Neither invents a check the
-`field` type has no knob for.
+The short version, for orientation: this side carries `display_name` and clamps over-long captions;
+that side carries `message.thread` / `thread_ts`, takes two credentials, and rejects rather than clamps.
+Trust the script and the slack README over this paragraph.
 
 ## Secrets / env
 
@@ -322,14 +362,23 @@ Two checks live here, and both are worth running on any change to the caps:
   controls purely. Nothing in Katari can read a constant out of the TypeScript, so this script is what
   stops the two copies drifting. Add a cap on one side without the other and it says so.
 
+A third check covers the *twin contract* and lives in the other package, because it needs both modules:
+`pnpm test` in `slack/` runs `scripts/check-twin.mjs`, which compares the two published surfaces name by
+name and argument by argument. Run it whenever this package's surface changes — it is what turns "the
+same data types with the same fields" from a claim in a README into something that fails a build.
+
 ## Usage
 
 ```katari
 import discord
 
 // Echo every message back to the channel it came from, attachments included.
-agent echo(message: discord.message) -> null {
-  discord.try_send(channel = message.channel, text = f"echo: ${message.text}", files = message.files)
+// The callback's argument is named `value`: that is what `watch_messages` calls it with.
+agent echo(value: discord.message) -> null {
+  // `try_send` answers with its outcome. An echo has nobody to report to, so it drops the answer
+  // deliberately — a bot that tells someone "posted" reads it instead.
+  let _outcome = discord.try_send(channel = value.channel, text = f"echo: ${value.text}", files = value.files)
+  null
 }
 
 agent echo_bot(channel: string) -> never {

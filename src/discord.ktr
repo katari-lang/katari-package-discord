@@ -11,6 +11,13 @@
 // The interaction plane is ONE agent, `ask`: it posts a prompt with `control` values in front of it and
 // blocks for the `answer`. Approving an action, taking free-form text, editing a draft and picking from
 // a list are that same call with different DATA — not four agents with four contracts.
+//
+// This module is the Discord half of a TWIN CONTRACT with the `slack` package: the same data types with
+// the same fields and the same agents with the same argument names, so a bot ports between them by
+// swapping the import. THE COMPLETE LIST OF DIVERGENCES LIVES IN ONE PLACE — the slack package's README,
+// under "Divergences" — and is checked mechanically by `slack/scripts/check-twin.mjs`, which reads both
+// modules and fails on a shape either side grew without the other. A second copy of that list here is a
+// second copy that would go stale, which is what the twin contract was already losing to.
 
 @"The live Discord gateway connection (the JS client lives in the sidecar; the handle is opaque)."
 request connection() -> string
@@ -98,7 +105,7 @@ callback. Prefer the watch_messages agent."
 external agent discord_watch[effect E](
   @"The opaque client handle to listen through." client: string,
   @"The channel to listen on." channel: string,
-  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (message: message) -> null with E,
+  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (value: message) -> null with E,
 ) -> never with E
 
 @"Post a message to a channel using the ambient Discord client, returning the posted MESSAGE'S ID —
@@ -186,10 +193,18 @@ resume window, or this run restarting each re-identify, and Discord backfills no
 session. A message can also be REPEATED, though far more rarely: a resume replays from the last
 sequence the shard RECORDED, which it advances when an event ARRIVES rather than after @deliver_to@
 returns. No dedup memory is kept here. A bot that must miss nothing reconciles against the channel's
-own history rather than trusting this stream."
+own history rather than trusting this stream.
+
+@deliver_to@'s own argument is named @value@, which is what changed in 0.6.0 and the reason it is a
+breaking change. Argument names are STRUCTURAL in Katari — a callback is passed by name, so a callback
+declared `(message: discord.message)` was accepted here and REJECTED by `gmail.watch` / `poll.subscribe`,
+which name theirs @value@ as the prelude's primary-argument convention says. The chat twins were the
+only holdouts, so the same agent could not be handed to a mail watch and a channel watch without an
+adapter that renamed one word. Rename the callback's parameter to @value@ (the type is unchanged) and
+`deliver_to = handler` keeps working everywhere."
 agent watch_messages[effect E](
   @"The channel to serve." channel: string,
-  @"Called once per incoming message, with the whole message as one value; its effects E flow to the caller's handlers." deliver_to: agent (message: message) -> null with E,
+  @"Called once per incoming message, with the whole message as one value; its effects E flow to the caller's handlers." deliver_to: agent (value: message) -> null with E,
 ) -> never with E | connection | io {
   discord_watch(client = connection(), channel = channel, deliver_to = deliver_to)
 }
@@ -688,6 +703,45 @@ agent check_controls(
       } else {
         valid()
       }
+    }
+  }
+}
+
+@"Shorten @text@ so it fits in ONE Discord message, ending it with @marker@ when anything was cut —
+the arithmetic every caller was doing against `limits()` by hand, and the half of that job which is
+mechanical rather than editorial.
+
+WHY IT IS NOT MERELY A SLICE. Past `limits()`'s @message_text@ Discord REFUSES the post rather than
+shortening it, so an over-long prompt is a question that can never be asked (a gate that can never be
+granted, failing identically on every retry) and an over-long reply is a message that never lands. The
+room is therefore @message_text@ MINUS the marker's own length, because the marker is part of what gets
+posted — measuring the text, cutting it to the cap and appending afterwards is the one way this is got
+wrong, and it puts the result back over the cap every time.
+
+WHY THE MARKER IS YOURS. Only the caller knows what the reader needs told, but SOMETHING must be told:
+text that was silently docked reads exactly like text that ended, and a model reading it will answer
+from a fragment as though it had the whole. Write the marker as the FACT — \"… (cut: the first 1,900 of
+7,400 characters)\" — rather than as a bare ellipsis, so whoever reads it knows to ask for the rest.
+
+Text that already fits comes back UNCHANGED, with no marker, so this is safe to wrap around everything.
+A @marker@ that alone exceeds the cap leaves no room for any text and comes back cut to the cap itself:
+the one guarantee here is that the result fits.
+
+Lengths are Katari code points and Discord counts UTF-16 units, so text within a couple of characters of
+the cap should be given a longer marker rather than trusted to either count."
+agent fit_message(
+  @"The text to fit; returned unchanged when it already does." text: string,
+  @"What to end the result with when anything was cut — your own words, saying that it was cut and ideally by how much." marker: string,
+) -> string {
+  let cap = limits().message_text
+  if (string.length(value = text) <= cap) {
+    text
+  } else {
+    let room = cap - string.length(value = marker)
+    if (room <= 0) {
+      string.slice(value = marker, start = 0, end = cap)
+    } else {
+      f"${string.slice(value = text, start = 0, end = room)}${marker}"
     }
   }
 }

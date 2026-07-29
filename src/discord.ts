@@ -756,7 +756,7 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
           // One `message` data value, bound to the callback's single parameter: the delivered shape is
           // named on both sides, so growing it later adds a field rather than shifting an argument.
           await deliver_to.call({
-            message: new KatariData("discord.message", {
+            value: new KatariData("discord.message", {
               channel: message.channelId,
               // The raw snowflake; the Katari side decides whether and how to hash it before it
               // leaves the program.
