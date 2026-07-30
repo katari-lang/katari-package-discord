@@ -1,18 +1,18 @@
-# discord — the Discord gateway, as Katari agents
+# discord — Discord chat, as Katari agents
 
 A single module, `discord`, plus its FFI sidecar `src/discord.ts`: a
-[discord.js](https://discord.js.org) gateway client behind a provider — the Discord twin of the Slack
-package. The connection is **owned by the provider** — log in once, and every call in its scope shares
-the same live gateway client. Independent of any AI layer: an app reacts to messages with whatever
-agent it hands to `watch_messages` as `deliver_to`.
+[discord.js](https://discord.js.org) client behind a provider — the Discord twin of the Slack
+package. The provider serves the **bot token**, and **every call takes it**: a token plus a channel is
+all anything here needs, so nothing a program holds can be invalidated by a restart. Independent of any
+AI layer: an app reacts to messages with whatever agent it hands to `watch_messages` as `deliver_to`.
 
 The surface is two planes: **messages** in and out, and **one interaction primitive**, `ask` — plus
-three pure-or-nearly-pure helpers that need no connection at all.
+three pure helpers that need no credential at all.
 
-- `discord.provider(source = ...)` — resolves the bot token ONCE (a `credentials.source`) and serves
-  the connection for the extent of the continuation. The client's lifetime is bound to the run: however
-  the provider ends — completion, cancel, an unwinding continuation — it is destroyed on the way out,
-  so a dead run leaves no logged-in session still handling events.
+- `discord.provider(source = ...)` — serves `discord.credential` from a `credentials.source` for the
+  extent of the continuation, resolved at **every** ask (a rotated token lands on the next call, not on
+  the next restart). It connects to nothing and closes nothing: a call that needs the gateway opens one
+  for its own lifetime.
 - `discord.watch_messages(channel, deliver_to)` — serve a channel forever, delivering each incoming
   message to your agent as one `discord.message(channel, author, display_name, text, files)` value.
   Bot posts (this bot's own replies included) are not delivered, so replying cannot loop. Never
@@ -38,25 +38,47 @@ three pure-or-nearly-pure helpers that need no connection at all.
 - `discord.author_tag(source, author, length ?= 8) -> string` — the keyed pseudonym for a speaker's
   snowflake, so a user id can reach a model or a log without being a user id.
 
-## Breaking changes in 0.6.0
+## Breaking changes in 0.7.0
 
-- **`watch_messages`'s `deliver_to` is called with `value`, not `message`.** Argument names are
-  structural in Katari, so a callback declared `(message: discord.message)` no longer type-checks here.
-  Rename its parameter to `value` — the type is unchanged — and `deliver_to = handler` keeps working.
-  The reason is the ecosystem, not this package: `gmail.watch` and `poll.subscribe` name theirs `value`
-  after the prelude's primary-argument convention, and the two chat twins were the only holdouts, so
-  one agent could not be handed to a mail watch and a channel watch without an adapter that renamed a
-  single word. The Slack twin made the same change in its 0.4.0.
-- New: `fit_message`. Nothing else moved.
+**The `connection` request is gone, and with it the whole idea of a connection a program holds.** What
+the provider serves is the bot token; what every call takes is that token and a channel.
+
+- **`discord.connection` → `discord.credential`** in every effect row. `with discord.connection | io`
+  becomes `with discord.credential | io`; nothing else about the call sites changes, because the
+  request is served by the same one-line `use discord.provider(source = ...)`.
+- **`create_discord_client` and `discord_close` are removed**, and the low-level externals take
+  `token: string of private` where they took `client: string` (`discord_send`, `discord_watch`,
+  `discord_ask`).
+- **`provider` no longer connects, and no longer throws `discord_error`.** Its row is now just the
+  credential's own (`env.missing_secret | oauth.server_error`). A bad token used to fail at
+  `use discord.provider(...)`; it now fails at the call that wanted the gateway.
+- **`watch_messages` now raises `discord_error`** (`prelude.throw[discord_error]` joined its row),
+  because opening the socket is its job. A bot that let a bad token stop it loudly at the provider gets
+  the same ending from the watch instead — with `auth_error` reaching the fork's `region.failed` as a
+  typed value rather than arriving as a panic.
+- **The token resolves at every call** rather than once at connect, so a rotation lands without a
+  restart. That was impossible while one login owned the scope.
+- Also fixed, on the way: `create_discord_client` logged in and `discord_watch` attached its listener
+  some later call afterwards, so **every message that arrived in that window was lost**. A watch now
+  registers before its socket comes up.
+
+**Why.** A durable program may hold only durable values, and the 0.6.0 client handle was a pointer into
+the sidecar's process memory: the sidecar kept `const clients = new Map()` keyed by that handle, so a
+runtime restart replayed the *same* handle into a *new* process whose map was empty, and every call
+through it panicked. Re-forking the watcher handed the replacement the same dead handle, which made the
+documented recovery a silent crash loop. The fix is not to detect the staleness — it is that a token and
+a channel name the remote thing from *any* process, so there is nothing left to go stale. (The `e2b`
+package was already built this way and never had the bug.)
 
 Files are first-class in both directions: an incoming message's attachments arrive as `file` values
 (the sidecar downloads each from Discord's CDN and uploads it over the blob side channel), and
 `send_message` posts `file` values back as Discord attachments.
 
-The low-level externals (`create_discord_client`, `discord_close`, `discord_send`, `discord_ask`,
-`discord_watch`) are implemented in the sidecar, which keeps the live clients in a module-level map
-keyed by opaque handle. `discord_close` is idempotent — a finalizer may run more than once, and a
-sidecar restart drops the map entirely.
+The low-level externals (`discord_send`, `discord_ask`, `discord_watch`) are implemented in the
+sidecar. `discord_send` is a plain REST call with no state at all. `discord_watch` / `discord_ask` need
+a live socket to *receive*, so the sidecar keeps one gateway per token, refcounted: the first of them
+opens it, the last one out closes it. Nothing in Katari names that cache, which is why sharing it is
+invisible — a restart simply starts with none, and the calls that were using it were already dead.
 
 **Delivery**: within one live gateway connection each message reaches `deliver_to` exactly once, in
 order. Across a **reconnect** nothing is guaranteed in either direction — the gateway has no per-event
@@ -65,6 +87,75 @@ or the run itself restarting all re-identify, and Discord backfills nothing onto
 far more rarely, repeated (a resume replays from the last sequence the shard recorded, which advances
 when an event *arrives*, not after `deliver_to` returns). No dedup memory is kept here. A bot that must
 miss nothing reconciles against the channel's own history.
+
+### Earlier releases
+
+- **0.6.0** — `watch_messages`'s `deliver_to` is called with `value`, not `message`: argument names are
+  structural in Katari, so a callback declared `(message: discord.message)` does not type-check here.
+  `gmail.watch` and `poll.subscribe` name theirs `value` after the prelude's primary-argument
+  convention, and the two chat twins were the only holdouts. New in the same release: `fit_message`.
+- **0.5.0** — `try_send` answers with its outcome (`delivered | dropped(reason)`).
+
+## What a runtime restart costs — and what a re-fork gets back
+
+**Re-fork the watcher and it serves the channel again.** That is the whole of 0.7.0's story, and in
+0.6.0 it was not true.
+
+A restart interrupts the external call that was in flight — the watch, or an open `ask` — under the
+at-most-once rule, which is unavoidable and arrives as a catchable panic. What is *not* lost is anything
+that names something remote: the token resolves afresh, the channel id is a channel id, and the new
+call opens its own socket. So the recovery is the plain one — a resident bot, whole:
+
+```katari
+import discord
+
+// The region's scope marker, and the ceiling its one fiber may raise. A fiber's THROWS sit outside the
+// ceiling by the region's contract: they arrive at the watch as `region.failed` instead.
+effect resident_scope
+type resident_ceiling = discord.credential | io
+
+data watcher_died(name: string, detail: string)
+
+agent reply(value: discord.message) -> null {
+  let _outcome = discord.try_send(channel = value.channel, text = f"echo: ${value.text}")
+  null
+}
+
+agent watch_channel(input: string) -> null with discord.credential | io | prelude.throw[discord.discord_error] {
+  discord.watch_messages(channel = input, deliver_to = reply)
+}
+
+agent resident(channel: string) -> never with io | prelude.throw[env.missing_secret | oauth.server_error | watcher_died] {
+  use discord.provider(source = credentials.env(key = "DISCORD_TOKEN"))
+  let nursery: region.nursery[resident_scope, resident_ceiling] = use region.provide[resident_scope, resident_ceiling]
+  use handler {
+    request region.crashed(id: string, name: string, message: string) {
+      // The interrupted call died with the restart; fork another watch and it connects again.
+      let _again = region.fork(nursery = nursery, task = watch_channel, argument = channel, name = "channel-watch")
+      next
+    }
+    // A throw that escaped the fiber is a fault no re-fork heals (a revoked token): stop loudly.
+    request region.failed(id: string, name: string, error: unknown) {
+      prelude.throw(error = watcher_died(name = name, detail = json.stringify(value = error)))
+    }
+  }
+  let _watcher = region.fork(nursery = nursery, task = watch_channel, argument = channel, name = "channel-watch")
+  region.watch(nursery = nursery)
+}
+```
+
+No supervisor ceremony, no re-establishing a session, no epoch to compare. What each ending means:
+
+| ending | what it is | what to do |
+| --- | --- | --- |
+| `region.crashed` | the call was interrupted (a restart, a teardown) — a panic carrying a message | fork the watch again |
+| `region.failed` with `auth_error` | the token is invalid or lacks a permission | stop loudly; an operator must fix it |
+| `region.failed` with `api_error` | Discord refused a call (a rate limit, an unsendable channel) | usually per-message; `try_send` already folds it |
+
+What a restart *does* cost: the messages that arrive while nothing is watching (the same gap a reconnect
+has, above), and an open `ask`'s posted controls, which nothing is left to strip — a late click gets
+Discord's own "interaction failed" notice, and the recovery is to ask again, since whoever wanted the
+answer wants it still.
 
 ## Who is speaking: an id, and a name that is not one
 
@@ -193,7 +284,7 @@ import discord
 data gate_unaskable(reason: string)
 agent refuse_to_open_the_gate(why: string) -> never with prelude.throw[gate_unaskable] { prelude.throw(error = gate_unaskable(reason = why)) }
 
-agent open_the_gate(channel: string, prompt: string) -> discord.answer with discord.connection | io | prelude.throw[discord.discord_error | gate_unaskable] {
+agent open_the_gate(channel: string, prompt: string) -> discord.answer with discord.credential | io | prelude.throw[discord.discord_error | gate_unaskable] {
   let controls = [discord.button(id = "approve", label = "approve"), discord.button(id = "deny", label = "deny")]
   match (discord.check_controls(controls = controls)) {
     case discord.valid() -> discord.ask(channel = channel, prompt = prompt, controls = controls)
@@ -231,7 +322,7 @@ must be told: text silently docked reads exactly like text that ended, and a mod
 answer from a fragment as though it had the whole. Write it as the fact ("the first 1,900 of 7,400
 characters"), not as a bare ellipsis.
 
-Both are **pure** — no connection, no `io`, nothing to catch — so they belong where the controls are
+Both are **pure** — no credential, no `io`, nothing to catch — so they belong where the controls are
 *built* (a gate's constructor, a test), which is the only place worth spending a check. `invalid` carries
 one sentence naming the offending control, the first problem in declaration order:
 
@@ -277,7 +368,7 @@ import discord
 @"…and what stands in for it when the operator denied." request refuse() -> null
 
 // Approval: two buttons, and the program branches on the id it wrote.
-agent approve(channel: string, what: string) -> null with discord.connection | do_it | skip | io | prelude.throw[discord.discord_error] {
+agent approve(channel: string, what: string) -> null with discord.credential | do_it | skip | io | prelude.throw[discord.discord_error] {
   match (discord.ask(
     channel = channel,
     prompt = f"Approve: ${what}?",
@@ -289,7 +380,7 @@ agent approve(channel: string, what: string) -> null with discord.connection | d
 }
 
 // Editing a draft: a PREFILLED form beside a deny button. A submit is approval AT THOSE VALUES.
-agent confirm_draft(channel: string, subject: string, body: string) -> null with discord.connection | send | refuse | io | prelude.throw[discord.discord_error] {
+agent confirm_draft(channel: string, subject: string, body: string) -> null with discord.credential | send | refuse | io | prelude.throw[discord.discord_error] {
   match (discord.ask(
     channel = channel,
     prompt = "Send this mail? Edit and submit to send, or deny.",
@@ -338,8 +429,8 @@ Trust the script and the slack README over this paragraph.
 ## Secrets / env
 
 - `DISCORD_TOKEN` — your bot token. Store it in the runtime:
-  `katari env set DISCORD_TOKEN --secret`. It is a `string of private`, passed straight to the
-  sidecar's login and never surfaced elsewhere.
+  `katari env set DISCORD_TOKEN --secret`. It is a `string of private`, resolved at every call and
+  passed straight to the sidecar, which authenticates each REST call and each gateway login with it.
 
 To get a token: create an application in the
 [Discord Developer Portal](https://discord.com/developers/applications), add a **Bot**, and copy its
@@ -386,6 +477,11 @@ agent echo_bot(channel: string) -> never {
   discord.watch_messages(channel = channel, deliver_to = echo)
 }
 ```
+
+That bot escalates `prelude.throw[discord.discord_error | env.missing_secret | oauth.server_error]` to
+its run root: nothing connects at the provider any more, so a bad token stops the watch rather than the
+`use`. A resident bot forks the watch into a region instead and re-forks it on `region.crashed` — see
+*What a runtime restart costs*, above.
 
 To hand file posting to an AI loop as a tool, bind `discord.send_message` under a role-specific
 description with a doc-on-`let` — the package no longer ships a separate `send_files` wrapper, because

@@ -1,8 +1,18 @@
-// The Discord library: a gateway-client capability plus the two planes a chat surface has — MESSAGES
+// The Discord library: a bot-token capability plus the two planes a chat surface has — MESSAGES
 // (in and out) and INTERACTIONS (one blocking question) — the Discord twin of the Slack package. The
 // externals are implemented in `discord.ts` (the same module path, so they register under `discord.*`).
 // The one-line integration is the provider:
 // `use discord.provider(source = credentials.env(key = "DISCORD_TOKEN"))`.
+//
+// EVERY EXTERNAL TAKES THE TOKEN, and nothing here carries a handle to a live connection. That is the
+// rule 0.7.0 was rebuilt on: a durable program may hold only durable values, and a pointer into the
+// sidecar's process memory is not one. A token plus a channel is a SELF-SUFFICIENT reference — any
+// process holding those two reaches the same channel — so a runtime restart costs the interrupted call
+// and nothing else: re-fork the watcher and it connects again. (0.6.0 served an opaque client handle
+// from a `connection` request, and a restart handed the program back a handle whose client was gone,
+// so every later call through it panicked and re-forking looped on the same dead handle.) The sidecar
+// still shares one gateway socket per token internally, refcounted, which no Katari value names and
+// nothing can observe.
 //
 // Files are first-class on both directions: an incoming message's attachments arrive as `file` values
 // (the sidecar downloads each and uploads it over the blob side channel), and `send_message` posts
@@ -19,50 +29,36 @@
 // modules and fails on a shape either side grew without the other. A second copy of that list here is a
 // second copy that would go stale, which is what the twin contract was already losing to.
 
-@"The live Discord gateway connection (the JS client lives in the sidecar; the handle is opaque)."
-request connection() -> string
+@"The Discord bot-token capability — provided at the root by `use discord.provider(...)`, resolved per
+call, so an env rotation or an oauth refresh lands without a restart. It is the WHOLE of what this
+package's calls need beside a channel: the token names the bot to Discord from any process, so nothing
+served here can be invalidated by a restart."
+request credential() -> string of private
 
-@"Provide the Discord gateway connection for the extent of the continuation: resolve @source@ ONCE
-(a gateway credential is fixed at connect — the websocket's nature, so a rotation lands on the next
-restart, not mid-connection), log in, then serve `connection` to everything downstream. A failed
-login (a bad token, a transient network fault) raises `discord_error` (`auth_error` | `api_error`) —
-surfacing here rather than on the first send."
+@"Provide the Discord bot token for the extent of the continuation: serve `credential` from @source@,
+resolved at EVERY ask (the source is a NAME — where the token lives — never a value, so a rotation
+lands on the next call rather than on the next restart).
+
+NOTHING IS CONNECTED HERE and nothing is closed on the way out, which is what changed in 0.7.0. A call
+that needs the gateway (`watch_messages`, `ask`) opens one for its own lifetime inside the sidecar, so
+a bad token surfaces THERE — as `discord_error` from the call that wanted it — rather than at this
+install site, and this provider's only failures are the credential's own (`env.missing_secret` /
+`oauth.server_error`)."
 agent provider[R, effect E](
-  @"Where the bot token lives (env key or oauth name); resolved once at connect." source: credentials.source,
-  @"Runs with `connection` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, connection},
-) -> R with E | io | prelude.throw[discord_error | env.missing_secret | oauth.server_error] {
-  let client = create_discord_client(token = credentials.resolve(source = source))
-  // Bind the gateway connection's lifetime to this run: however the provider ends — normal completion,
-  // cancel, or the continuation unwinding — destroy the client on the way out, so a dead run does not
-  // leave a logged-in gateway session still receiving and handling events.
-  finally { discord_close(client = client) }
+  @"Where the bot token lives (env key or oauth name); resolved at each `credential` ask." source: credentials.source,
+  @"Runs with `credential` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, credential},
+) -> R with E | io | prelude.throw[env.missing_secret | oauth.server_error] {
   use handler {
-    request connection() { next client }
+    request credential() -> string of private { next credentials.resolve(source = source) }
   }
   continuation(value = null)
 }
 
-@"Connect to Discord and log in; returns an opaque client handle. Raises `discord_error` (`auth_error`
-| `api_error`) when the login fails — an invalid token / missing permission is `auth_error`, a transient
-network fault `api_error`. Prefer the provider."
-external agent create_discord_client(
-  @"The bot token to log in with." token: string of private,
-) -> string with prelude.throw[discord_error]
-
-@"Close a Discord connection: destroy the gateway client and drop the handle. The provider arms this
-as a `finally`, so the connection dies with the run — a gateway client left alive stays logged in and
-keeps receiving events long after its run is gone, a leaked session that still handles messages.
-Idempotent: closing an unknown or already-closed handle is a no-op, since a finalizer may run more
-than once."
-external agent discord_close(
-  @"The opaque client handle `create_discord_client` returned." client: string,
-) -> null
-
 @"An authentication / authorization failure: the bot token is invalid or expired (HTTP 401), or the
 bot lacks permission in the channel (HTTP 403); @message@ carries Discord's error. The bot cannot
-recover on its own — the operator must fix the token or the bot's permissions and restart the run (the
-connection is fixed at start). Let it surface so the bot stops loudly rather than silently dropping
-every reply."
+recover on its own — the operator must fix the token or the bot's permissions. Let it surface so the
+bot stops loudly rather than silently dropping every reply. (A rotated token does not need a restart:
+every call resolves the credential afresh.)"
 data auth_error(message: string)
 
 @"A Discord API call failed for a non-auth reason: a rate limit (HTTP 429), a channel that is not a
@@ -90,25 +86,30 @@ data message(
   @"The attachments, already downloaded into `file` values." files: array[file],
 )
 
-@"Low-level: post to a channel on a given client, with any files as attachments, returning the posted
-message's id. Raises `auth_error` or `api_error` (`discord_error`) when the Discord API call fails.
-Prefer the send_message agent."
+@"Low-level: post to a channel with the bot @token@, with any files as attachments, returning the
+posted message's id. A plain REST call — no gateway, nothing kept between calls — so it behaves
+identically before and after a restart. Raises `auth_error` or `api_error` (`discord_error`) when the
+Discord API call fails. Prefer the send_message agent."
 external agent discord_send(
-  @"The opaque client handle to post through." client: string,
+  @"The bot token to post with." token: string of private,
   @"The channel to post into." channel: string,
   @"The message text; empty means an attachments-only post." text: string,
   @"Files to attach to the post." files: array[file],
 ) -> string with prelude.throw[discord_error]
 
-@"Low-level: listen on a channel and deliver each incoming message as one `message` value to a
-callback. Prefer the watch_messages agent."
+@"Low-level: listen on a channel with the bot @token@ and deliver each incoming message as one
+`message` value to a callback. The sidecar opens the gateway socket for THIS CALL'S lifetime (shared
+with any other live watch or ask on the same token, closed when the last of them ends) and attaches the
+listener before the socket comes up, so nothing that arrives on a fresh connection is delivered to
+nobody. Raises `discord_error` when the gateway will not open — an invalid token is `auth_error`.
+Prefer the watch_messages agent."
 external agent discord_watch[effect E](
-  @"The opaque client handle to listen through." client: string,
+  @"The bot token to listen with." token: string of private,
   @"The channel to listen on." channel: string,
   @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (value: message) -> null with E,
-) -> never with E
+) -> never with E | prelude.throw[discord_error]
 
-@"Post a message to a channel using the ambient Discord client, returning the posted MESSAGE'S ID —
+@"Post a message to a channel with the ambient bot token, returning the posted MESSAGE'S ID —
 the composable seam a later edit / reaction / thread-reply agent will address a message by, so a
 caller that needs to refer back keeps it (and one that does not simply drops it). @files@ attach to
 the post. Raises `discord_error` (`auth_error` | `api_error`) when the send fails — catch `api_error`
@@ -119,7 +120,7 @@ agent send_message(
   @"The message text; empty means an attachments-only post." text: string,
   @"Files to attach; defaults to none." files: array[file] ?= [],
 ) -> string {
-  discord_send(client = connection(), channel = channel, text = text, files = files)
+  discord_send(token = credential(), channel = channel, text = text, files = files)
 }
 
 @"A `try_send` that REACHED the channel: the message is posted. It carries nothing — a caller that
@@ -195,18 +196,21 @@ sequence the shard RECORDED, which it advances when an event ARRIVES rather than
 returns. No dedup memory is kept here. A bot that must miss nothing reconciles against the channel's
 own history rather than trusting this stream.
 
-@deliver_to@'s own argument is named @value@, which is what changed in 0.6.0 and the reason it is a
-breaking change. Argument names are STRUCTURAL in Katari — a callback is passed by name, so a callback
-declared `(message: discord.message)` was accepted here and REJECTED by `gmail.watch` / `poll.subscribe`,
-which name theirs @value@ as the prelude's primary-argument convention says. The chat twins were the
-only holdouts, so the same agent could not be handed to a mail watch and a channel watch without an
-adapter that renamed one word. Rename the callback's parameter to @value@ (the type is unchanged) and
-`deliver_to = handler` keeps working everywhere."
+A runtime restart INTERRUPTS this call and costs nothing else, which is what changed in 0.7.0: the
+token is the whole of what the sidecar needs, so a re-forked watch opens a new socket and serves the
+same channel again. (0.6.0 handed the re-fork the opaque client handle it was still carrying, whose
+client had died with the process, so every attempt panicked identically — a silent crash loop where a
+plain `region.crashed` → fork again now works.) What the interruption costs is the messages that arrive
+while nothing is watching, which is the reconnect gap above and not a new one.
+
+It RAISES `discord_error` (`auth_error` | `api_error`) when the gateway will not open, because opening
+it is now this call's job: `use discord.provider(...)` connects to nothing and so throws no
+`discord_error` at all. An invalid token stops the watch as `auth_error` on its first attempt."
 agent watch_messages[effect E](
   @"The channel to serve." channel: string,
   @"Called once per incoming message, with the whole message as one value; its effects E flow to the caller's handlers." deliver_to: agent (value: message) -> null with E,
-) -> never with E | connection | io {
-  discord_watch(client = connection(), channel = channel, deliver_to = deliver_to)
+) -> never with E | credential | io | prelude.throw[discord_error] {
+  discord_watch(token = credential(), channel = channel, deliver_to = deliver_to)
 }
 
 // ── the interaction plane: the controls a question offers, and the answer one of them returns ────
@@ -290,10 +294,12 @@ data submitted(
 // Which control completed the question, and with what. (Type synonyms take no docs.)
 type answer = clicked | chose | submitted
 
-@"Low-level: post a prompt with its controls on a given client and await the first completed
-interaction. Prefer the ask agent."
+@"Low-level: post a prompt with its controls to a channel with the bot @token@ and await the first
+completed interaction. The sidecar brings the gateway socket up BEFORE the question posts (Discord
+delivers an interaction only to a session connected at the moment of the click) and lets it go when the
+question ends. Prefer the ask agent."
 external agent discord_ask(
-  @"The opaque client handle to post through." client: string,
+  @"The bot token to ask with." token: string of private,
   @"The channel to ask in." channel: string,
   @"The question posted above the controls." prompt: string,
   @"The controls to present, in order." controls: array[control],
@@ -327,11 +333,15 @@ withdrawal is `region.cancel_by_id` on the fiber holding it. One blocking questi
 both, whereas an expiry baked in here would make every caller handle a timeout it never asked for.
 
 The wait rides one external call, so a runtime restart while it is open interrupts it under the
-at-most-once rule (a catchable panic) and the posted controls go stale. That is the DESIGNED outcome,
-not a defect to absorb here: let the panic ride to your supervisor and ask again — whoever wanted the
-answer wants it still — rather than inventing an answer for an interaction that never landed.
+at-most-once rule (a catchable panic) and the controls already in the channel go stale — nothing is left
+to strip them, so a late click gets Discord's own \"interaction failed\" notice. That is the DESIGNED
+outcome, not a defect to absorb here: let the panic ride to your supervisor and ASK AGAIN — whoever
+wanted the answer wants it still — rather than inventing an answer for an interaction that never landed.
+Asking again is the whole recovery as of 0.7.0: the new ask resolves the token and opens its own socket,
+with no connection left over from before to be dead.
 
-Raises `discord_error` when a Discord call fails: posting the question, or opening a form's dialog.
+Raises `discord_error` when a Discord call fails: opening the gateway (an invalid token is `auth_error`),
+posting the question, or opening a form's dialog.
 
 A control past one of Discord's caps splits two ways, and the split is what stops a cosmetic string
 from being able to break a run. PRESENTATION is CLAMPED, never fatal: a `button`'s or `form`'s @label@
@@ -346,8 +356,8 @@ rejecting the payload and still `api_error`: a sixth row, a 26th option, a dialo
 
 RUN `check_controls` WHERE THE CONTROLS ARE BUILT, not here. It answers every one of those caps —
 including the counts above and the duplicate @id@ neither side catches — as a VALUE, purely, with no
-connection needed: a gate's constructor can refuse itself before a run ever starts. It is not wired
-into this agent on purpose. `ask` returns an `answer` and has no room in that type for a verdict, so
+credential and no connection needed: a gate's constructor can refuse itself before a run ever starts.
+It is not wired into this agent on purpose. `ask` returns an `answer` and has no room in that type for a verdict, so
 an internal check could only THROW — and a cosmetic string that can throw is the exact failure this
 package's clamping was written to remove. So the verdict stays a value, `ask` stays unchanged, and
 what a failed check means is the caller's decision.
@@ -362,8 +372,8 @@ agent ask(
   @"The channel to ask in — its membership is who may answer." channel: string,
   @"The question posted above the controls." prompt: string,
   @"What the human may complete: `button` / `select` / `form` values, rendered in order. Each control's @id@ must be DISTINCT within one ask — the id is the correlation key Discord carries back, so a repeat is unroutable rather than merely untidy (the sidecar keeps the first and warns). Discord fits at most 5 rows on a message: up to 5 buttons share a row, each dropdown takes one of its own. `check_controls` answers all of this as a value, before the question posts." controls: array[control],
-) -> answer with connection | io | prelude.throw[discord_error] {
-  discord_ask(client = connection(), channel = channel, prompt = prompt, controls = controls)
+) -> answer with credential | io | prelude.throw[discord_error] {
+  discord_ask(token = credential(), channel = channel, prompt = prompt, controls = controls)
 }
 
 // ── the platform's numbers, and a local check against them ───────────────────────────────────────
@@ -374,7 +384,7 @@ agent ask(
 // publishes the numbers as data and `check_controls` reads them, so "is this question askable?" is a
 // VALUE a program computes before the question posts, next to the code that built the controls.
 //
-// Both are PURE: no connection, no io, nothing to catch. A check that needed the gateway would be a
+// Both are PURE: no credential, no io, nothing to catch. A check that needed the gateway would be a
 // check nobody runs at construction time, which is the only time it is worth running.
 
 @"Discord's limits on what ONE question may present, as data — the numbers this package's renderer
@@ -444,7 +454,7 @@ data invalid(@"Which control, and what is wrong with it." reason: string)
 type control_check = valid | invalid
 
 @"Check @controls@ against Discord's caps LOCALLY and answer with a VALUE — `valid`, or `invalid`
-carrying one sentence naming the offending control. Pure: no connection, no io, nothing to catch, so
+carrying one sentence naming the offending control. Pure: no credential, no io, nothing to catch, so
 it belongs where the controls are BUILT (a gate's constructor, a test) rather than where they are
 asked.
 

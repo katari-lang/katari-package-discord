@@ -1,6 +1,20 @@
-// The sidecar half of `discord.ktr` — the discord.js gateway client. Handlers register under this
-// file's module path (`discord.*`). Clients live in a module-level map for the sidecar process's
-// lifetime (one process per snapshot), keyed by the opaque handle Katari carries around.
+// The sidecar half of `discord.ktr` — a discord.js REST client for what Discord can be TOLD, and a
+// gateway socket for what it has to be LISTENED to for. Handlers register under this file's module path
+// (`discord.*`).
+//
+// EVERY HANDLER TAKES THE BOT TOKEN, and no Katari value names anything in this process. That is the FFI
+// rule 0.7.0 was rebuilt on: a durable program may hold only durable values, and a handle into this
+// module's memory is not one. 0.6.0's registry (`const clients = new Map()`, keyed by an opaque handle
+// the program carried around) handed a RESTARTED runtime a handle whose client was gone, so every call
+// through it failed — and its own comment called an unknown handle "a program defect", which was exactly
+// the mistake: a restart produces one legitimately, and no amount of care in the program prevents it.
+//
+// So both caches below are keyed by the TOKEN and pointed at by nothing. `discord_send` is a plain REST
+// call with no state at all: a token and a channel name the remote thing from any process, which is the
+// whole of self-sufficiency. `discord_watch` / `discord_ask` need a live socket to RECEIVE, so they lease
+// one per token — refcounted, closed when the last of them ends. A restart loses the interrupted call
+// (at-most-once, unavoidable), the cache comes up empty, and the calls that held it were already dead:
+// re-fork the watcher and it connects again.
 //
 // Files cross in both directions: an outgoing message's `file` values download over the blob side
 // channel and attach to the Discord post; an incoming message's attachments download from Discord's
@@ -29,18 +43,17 @@ import {
   GatewayIntentBits,
   GuildMember,
   LabelBuilder,
-  type Message,
   type MessageActionRowComponentBuilder,
   type MessageComponentInteraction,
   ModalBuilder,
   type ModalSubmitInteraction,
+  type RawFile,
+  REST,
+  Routes,
   StringSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
 } from "discord.js";
-
-const clients = new Map<string, Client>();
-let nextHandle = 1;
 
 /** How many buttons Discord fits on one action row. */
 const BUTTONS_PER_ROW = 5;
@@ -62,10 +75,139 @@ function discordErrorMessage(error: unknown): string {
 /** The qualified `discord_error` constructor for a failure: an invalid token (HTTP 401) or a missing
  *  permission (HTTP 403) is `auth_error` — the operator must fix the credential; everything else (a
  *  rate limit, an unsendable channel, a transient fault) is `api_error`. A failure with no HTTP status
- *  (a transport fault, an unsendable-channel guard) defaults to `api_error`. */
+ *  (a transport fault, a malformed reply) defaults to `api_error`. */
 function discordErrorConstructor(error: unknown): string {
   const status = property(error, "status");
   return status === 401 || status === 403 ? "discord.auth_error" : "discord.api_error";
+}
+
+// ─── the two caches: a token's REST client, and a token's gateway socket ───────────────────────────
+
+/** The REST client for a bot token — the whole of what a stateless call needs. Cached to reuse the
+ *  connection pool and the route rate-limit buckets, and for NO other reason: a fresh one behaves
+ *  identically, so nothing observable rides on this map and a restart that empties it changes nothing. */
+const restClients = new Map<string, REST>();
+
+function restFor(token: string): REST {
+  const cached = restClients.get(token);
+  if (cached !== undefined) return cached;
+  const rest = new REST({ version: "10" }).setToken(token);
+  restClients.set(token, rest);
+  return rest;
+}
+
+/** The part of a gateway MESSAGE_CREATE this package reads, named so the fan-out below has a type to
+ *  hand each watcher. */
+interface IncomingMessage {
+  author: { bot: boolean; id: string; globalName: string | null; username: string };
+  // The guild member the author is in the channel's server, and null in a DM — where there is no server
+  // to hold a nickname. The display-name chain is total without it.
+  member: { nickname: string | null } | null;
+  channelId: string;
+  content: string;
+  attachments: Map<string, { url: string; contentType: string | null }>;
+}
+
+/** One live `discord_watch`, called with every message the socket receives; it filters by its own
+ *  channel. */
+type MessageWatcher = (message: IncomingMessage) => void;
+
+/** One open `discord_ask`, called with each interaction that arrived for its question. */
+type QuestionRouter = (interaction: MessageComponentInteraction | ModalSubmitInteraction) => void;
+
+/** One gateway socket, shared by every live `discord_watch` / `discord_ask` on the same token. The
+ *  sharing is invisible: no Katari value names it, so a restart just starts with none. */
+interface Gateway {
+  client: Client;
+  /** Resolves when the socket is IDENTIFIED and receiving; rejects with the login failure. A question
+   *  waits for it before posting, because Discord delivers an interaction only to a session that is
+   *  connected at the moment the human clicks — a click that lands on nobody is a click nobody repeats. */
+  ready: Promise<void>;
+  /** How many live calls hold this socket. The last one out closes it. */
+  leases: number;
+  /** The live watches, and the open questions keyed by the id of the message their controls are on.
+   *  ONE emitter listener fans out to each set, so a bot holding a dozen watches or questions still
+   *  installs exactly one (Node warns past ten on an emitter). */
+  watchers: Set<MessageWatcher>;
+  questions: Map<string, QuestionRouter>;
+}
+
+const gateways = new Map<string, Gateway>();
+
+/** Lease the gateway socket for `token`, opening one if this is the first caller.
+ *
+ *  SYNCHRONOUS on purpose. The caller registers itself on the returned gateway before awaiting `ready`,
+ *  so there is no window in which this package is connected and receiving events that a caller asked
+ *  for but is not yet listening for. 0.6.0 had exactly that window — `create_discord_client` logged in,
+ *  and `discord_watch` attached its listener some later call afterwards — and every message that
+ *  arrived in between was lost with nothing reporting it.
+ *
+ *  A login FAILURE evicts the entry and abandons the client, so the next call opens a fresh socket
+ *  rather than inheriting a cached rejection. */
+function acquireGateway(token: string): Gateway {
+  const existing = gateways.get(token);
+  if (existing !== undefined) {
+    existing.leases += 1;
+    return existing;
+  }
+  const client = new Client({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+    ],
+  });
+  const watchers = new Set<MessageWatcher>();
+  const questions = new Map<string, QuestionRouter>();
+  // The routers go on BEFORE the login, so the socket has somewhere to deliver its first event.
+  client.on(Events.MessageCreate, (message) => {
+    for (const watcher of watchers) watcher(message);
+  });
+  client.on(Events.InteractionCreate, (interaction) => {
+    if (!interaction.isMessageComponent() && !interaction.isModalSubmit()) return;
+    // Both a component press and a dialog submit carry the message their controls are on, and that is
+    // the question's identity here: two questions open in the same channel, even offering the same
+    // control id, cannot cross. A submit is a FRESH interaction with its own token, which is why it
+    // arrives on the client rather than on the message that opened it.
+    const originating = interaction.message?.id;
+    if (originating === undefined) return;
+    questions.get(originating)?.(interaction);
+  });
+  const ready = new Promise<void>((resolve, reject) => {
+    client.once(Events.ClientReady, () => resolve());
+    // Logging in is the connect: an invalid token (Discord answers the gateway fetch 401), a disallowed
+    // intent or a transient network fault fails here, and the caller classifies it as `discord_error`.
+    client.login(token).catch((error: unknown) => {
+      // A failed open is not cached — the next call opens a fresh socket, as e2b's provider retries an
+      // open it could not complete. Identity-checked, so a later call's own gateway is never evicted.
+      // discord.js destroys the client itself before rejecting, so there is nothing left to close here.
+      const current = gateways.get(token);
+      if (current?.client === client) gateways.delete(token);
+      reject(error);
+    });
+  });
+  const gateway: Gateway = { client, ready, leases: 1, watchers, questions };
+  gateways.set(token, gateway);
+  return gateway;
+}
+
+/** Give up one lease, closing the socket when the last holder leaves: a gateway kept alive past the
+ *  calls that wanted it is a bot still logged in with nobody listening. Lingering instead — holding the
+ *  socket a while in case another call wants it — would be a timer bought with a connection nobody is
+ *  using, so the close is immediate and a re-fork pays a fresh login.
+ *
+ *  Identity-checked rather than keyed: a gateway whose login failed was already evicted and may have
+ *  been replaced by a later call's own socket, which this lease never held. */
+async function releaseGateway(token: string, gateway: Gateway): Promise<void> {
+  if (gateways.get(token) !== gateway) return;
+  gateway.leases -= 1;
+  if (gateway.leases > 0) return;
+  gateways.delete(token);
+  try {
+    await gateway.client.destroy();
+  } catch {
+    // The socket is going either way, and a failed teardown must not replace the call's own outcome.
+  }
 }
 
 /** The name Discord's own client shows for a person, resolved the way that client resolves it: the
@@ -152,79 +294,59 @@ function sniffedContentType(bytes: Uint8Array): string | undefined {
   return undefined;
 }
 
-katari.agent<{ token: string }>("create_discord_client", async ({ token }) => {
-  const client = new Client({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent,
-    ],
-  });
-  try {
-    // Logging in is the connect: an invalid token / missing permission or a transient network fault
-    // fails here. Raise it as the declared `prelude.throw[discord_error]`, classified auth vs api by
-    // HTTP status (the credential is fixed at start, so a bad token cannot recover), so the provider's
-    // caller can catch it instead of the run panicking. Nothing to close — the client never logged in.
-    await client.login(token);
-  } catch (error) {
-    katari.throw(new KatariData(discordErrorConstructor(error), { message: discordErrorMessage(error) }));
+/** The message id off a Discord reply to a post. A 2xx that names no message is a malformed reply, and
+ *  calling it a success would hand the program back an id nothing can address — the same shape filter
+ *  `e2b_put_file` applies to the path a write reports. */
+function postedMessageId(reply: unknown, what: string): string {
+  const id = property(reply, "id");
+  if (typeof id !== "string" || id === "") {
+    throw new Error(`Discord confirmed ${what} with no message id`);
   }
-  const handle = `discord-${nextHandle}`;
-  nextHandle += 1;
-  clients.set(handle, client);
-  return handle;
-});
+  return id;
+}
 
-katari.agent<{ client: string }>("discord_close", async ({ client }) => {
-  // The provider arms this as a `finally`, so a run that ends (completes, is cancelled, or unwinds)
-  // tears its gateway connection down: a client left alive stays logged in and keeps receiving events
-  // long after its run is gone.
-  const connection = clients.get(client);
-  // Idempotent: an unknown or already-closed handle is a no-op — a finalizer may run more than once,
-  // and a sidecar restart drops the map entirely.
-  if (connection === undefined) return null;
-  // Drop the entry before destroying so a re-run (or a concurrent lookup) cannot see it half-closed.
-  clients.delete(client);
-  // The dialog routing table dies with the client it routed for; its listener goes with `destroy`.
-  modalWaiters.delete(connection);
-  // `destroy` logs the bot out and closes the gateway WebSocket — discord.js's documented shutdown.
-  await connection.destroy();
-  return null;
-});
+/** The multipart parts for a katari `file` list. Each file's bytes come over the blob side channel; the
+ *  slim handle carries no metadata, so the MIME type rides in with the same download. */
+async function attachmentParts(files: KatariFile[]): Promise<RawFile[]> {
+  return Promise.all(
+    files.map(async (file, index) => {
+      const contentType = await file.contentType();
+      return {
+        data: Buffer.from(await file.bytes()),
+        name: attachmentName(contentType, index),
+        ...(contentType === undefined ? {} : { contentType }),
+      };
+    }),
+  );
+}
 
-katari.agent<{ client: string; channel: string; text: string; files: KatariFile[] }>(
+/** The `attachments` entries that pair a post's uploaded parts with its payload, by index — the shape
+ *  discord.js's own message payload sends; the filename travels on the multipart part itself. */
+function attachmentDescriptors(parts: RawFile[]): { id: string }[] {
+  return parts.map((_part, index) => ({ id: index.toString() }));
+}
+
+katari.agent<{ token: string; channel: string; text: string; files: KatariFile[] }>(
   "discord_send",
-  async ({ client, channel, text, files }) => {
-    // An unknown handle is a program defect (a `client` value the runtime never minted), so it stays a
-    // bare throw = panic; only the Discord API calls below fail at execution and become a catchable
-    // `discord_error`.
-    const connection = connectionOf(client);
+  async ({ token, channel, text, files }) => {
     try {
-      const target = await connection.channels.fetch(channel);
-      if (target === null || !target.isSendable()) {
-        // Not a bug — a per-channel execution failure; the catch below tags it `api_error` (no HTTP
-        // status).
-        throw new Error(`channel ${channel} is not a sendable text channel`);
-      }
-      // Each file's bytes come over the blob side channel; Discord wants a Buffer + a filename. The
-      // slim handle carries no metadata, so the MIME type rides in with the same download.
-      const attachments = await Promise.all(
-        files.map(async (file, index) => ({
-          attachment: Buffer.from(await file.bytes()),
-          name: attachmentName(await file.contentType(), index),
-        })),
-      );
-      const posted = await target.send({
-        // Discord rejects an empty content string; with attachments the text is optional.
-        ...(text === "" ? {} : { content: text }),
-        ...(attachments.length > 0 ? { files: attachments } : {}),
+      const parts = await attachmentParts(files);
+      const posted = await restFor(token).post(Routes.channelMessages(channel), {
+        body: {
+          // Discord rejects an empty content string; with attachments the text is optional.
+          ...(text === "" ? {} : { content: text }),
+          ...(parts.length > 0 ? { attachments: attachmentDescriptors(parts) } : {}),
+        },
+        ...(parts.length > 0 ? { files: parts } : {}),
       });
       // The posted message's id — the seam a later edit / reaction / thread reply addresses.
-      return posted.id;
+      return postedMessageId(posted, "the post");
     } catch (error) {
       // Raise the execution failure as the declared `prelude.throw[discord_error]`, classified auth vs
       // api by HTTP status (qualified constructor name — the boundary checks the tag against the schema
-      // const), so the caller can catch it instead of the run panicking.
+      // const), so the caller can catch it instead of the run panicking. A channel that is not a
+      // sendable text channel, a channel id that names nothing and a payload past a platform cap are
+      // all Discord's own refusals now, and all `api_error`.
       katari.throw(new KatariData(discordErrorConstructor(error), { message: discordErrorMessage(error) }));
       // `katari.throw` never returns; the rethrow only satisfies the declared return type.
       throw error;
@@ -283,7 +405,8 @@ function formFields(fields: unknown, key: string): FormField[] {
 
 /** Read one decoded `control` value. An unrecognised constructor means the wire disagrees with the
  *  schema the compiler checked, which is a defect rather than an execution failure — so it stays a bare
- *  throw (a panic), like an unknown client handle. */
+ *  throw (a panic). Nothing else in this file throws bare any more: the one other place that did was the
+ *  handle lookup, whose "defect" a restart produced by itself. */
 function readControl(value: unknown): Control {
   const fields = value instanceof KatariData ? value.value : undefined;
   const name = value instanceof KatariData ? value.name : "";
@@ -482,19 +605,28 @@ async function acknowledge(
 }
 
 /** Take the controls away and leave @outcome@ in their place, so the channel keeps a readable record and
- *  a late click has nothing to press. EVERY way a question ends comes through here — an answer, and a
- *  cancel — because a question that has stopped mattering must stop looking answerable: live controls on
- *  a dead ask offer nothing but the platform's bare "interaction failed".
+ *  a late click has nothing to press. EVERY way a question ends comes through here — an answer, a failure,
+ *  and a cancel — because a question that has stopped mattering must stop looking answerable: live
+ *  controls on a dead ask offer nothing but the platform's bare "interaction failed".
  *
- *  Edited with the BOT token rather than through the interaction, because an interaction's token expires
- *  fifteen minutes after it was issued while a bot's edit never does — and a dialog may be submitted long
- *  after the click that opened it, while a cancel arrives with no interaction in hand at all.
+ *  Edited over REST with the BOT token rather than through the interaction, for two reasons that point
+ *  the same way: an interaction's token expires fifteen minutes after it was issued while a bot's edit
+ *  never does (and a dialog may be submitted long after the click that opened it, while a cancel arrives
+ *  with no interaction in hand at all), and a REST call outlives the gateway lease the ask is giving up.
  *
  *  Best effort, for the same reason `acknowledge` is: on the answer path a decision must not be lost to a
  *  cosmetic edit, and on the cancel path a cosmetic edit must not break the cancel. */
-async function stripControls(posted: Message, prompt: string, outcome: string): Promise<void> {
+async function stripControls(
+  rest: REST,
+  channel: string,
+  posted: string,
+  prompt: string,
+  outcome: string,
+): Promise<void> {
   try {
-    await posted.edit({ content: `${prompt}\n→ ${outcome}`, components: [] });
+    await rest.patch(Routes.channelMessage(channel, posted), {
+      body: { content: `${prompt}\n→ ${outcome}`, components: [] },
+    });
   } catch {
     // The stale controls stay; clicking one gets Discord's own "interaction failed" notice.
   }
@@ -529,269 +661,256 @@ function controlsById(controls: Control[]): Map<string, Control> {
   return byId;
 }
 
-/** Called with each dialog submit that arrived for one open question. */
-type ModalWaiter = (interaction: ModalSubmitInteraction) => void;
-
-/** The open questions waiting on a dialog submit, per client, keyed by the id of the message whose
- *  button opened the dialog.
- *
- *  A submit is a FRESH interaction with its own token — which is why waiting for it is unbounded — and
- *  it arrives on the CLIENT rather than on the message's component collector, so it has to be routed.
- *  Routing by the submit's originating message id is exact: two questions open in the same channel, even
- *  offering the same form id, cannot cross. One shared listener per client does the fan-out, so a bot
- *  holding dozens of open questions still installs exactly one (Node warns past ten on an emitter). */
-const modalWaiters = new Map<Client, Map<string, ModalWaiter>>();
-
-function modalWaitersOf(client: Client): Map<string, ModalWaiter> {
-  const existing = modalWaiters.get(client);
-  if (existing !== undefined) return existing;
-  const waiters = new Map<string, ModalWaiter>();
-  modalWaiters.set(client, waiters);
-  client.on(Events.InteractionCreate, (interaction) => {
-    if (!interaction.isModalSubmit()) return;
-    const originating = interaction.message?.id;
-    if (originating === undefined) return;
-    waiters.get(originating)?.(interaction);
-  });
-  return waiters;
-}
-
-katari.agent<{ client: string; channel: string; prompt: string; controls: unknown[] }>(
+katari.agent<{ token: string; channel: string; prompt: string; controls: unknown[] }>(
   "discord_ask",
-  async ({ client, channel, prompt, controls }, context) => {
-    const connection = connectionOf(client);
+  async ({ token, channel, prompt, controls }, context) => {
     const rendered = controls.map(readControl);
-    let posted: Message;
+    const rest = restFor(token);
+    // The socket comes up BEFORE the question posts: Discord delivers an interaction only to a session
+    // connected at the moment of the click, so a gateway opened after the post would miss an answer
+    // nobody would give twice. It is released in the `finally` below, however this ends.
+    const gateway = acquireGateway(token);
     try {
-      const target = await connection.channels.fetch(channel);
-      if (target === null || !target.isSendable()) {
-        throw new Error(`channel ${channel} is not a sendable text channel`);
-      }
-      posted = await target.send({ content: prompt, components: renderRows(rendered) });
-    } catch (error) {
-      // Rendering AND posting the question both sit inside this try, so neither a builder that refuses a
-      // control (a load-bearing string out of range) nor the platform rejecting the payload (a 26th
-      // dropdown option, a sixth row) can escape as anything but the declared `discord_error`, classified
-      // and raised exactly as discord_send does. `renderRows` belongs in here rather than above it for
-      // that reason: a builder's refusal is synchronous.
-      katari.throw(new KatariData(discordErrorConstructor(error), { message: discordErrorMessage(error) }));
-      // `katari.throw` never returns; the rethrow only satisfies definite assignment on `posted`.
-      throw error;
-    }
-    // The wait: the FIRST COMPLETED interaction is the answer. No time limit — a decision may land hours
-    // later; a runtime restart interrupts the external call under the at-most-once rule. The collector
-    // deliberately takes no `max`, because clicking is not answering: opening a form's dialog and closing
-    // it again completes nothing, so the question has to stay open for the next attempt.
-    return new Promise<KatariData<Record<string, unknown>>>((resolve, reject) => {
-      const byId = controlsById(rendered);
-      const waiters = modalWaitersOf(connection);
-      const collector = posted.createMessageComponentCollector();
-      let settled = false;
-      const cleanup = () => {
-        collector.stop();
-        waiters.delete(posted.id);
-      };
-      /** Fail the ask with the declared `discord_error` (a `KatariThrowError` rejection becomes a typed
-       *  `throw` reply, not a panic), so a Discord call that breaks the question is catchable at the call
-       *  site rather than leaving it hanging on an answer that can no longer be given. */
-      const fail = (error: unknown) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        // The question is over either way, so its controls come off here too — same reason as the cancel
-        // path: nothing is waiting behind them.
-        void stripControls(posted, prompt, "(failed)");
-        reject(
-          new KatariThrowError(
-            new KatariData(discordErrorConstructor(error), { message: discordErrorMessage(error) }),
-          ),
-        );
-      };
-      /** Settle the ask with the answer this interaction completed. Never rejects: everything after the
-       *  answer is best effort, so `void`-ing a call cannot drop a failure. */
-      const answerWith = async (
-        interaction: MessageComponentInteraction | ModalSubmitInteraction,
-        answer: KatariData<Record<string, unknown>>,
-        completed: string,
-      ): Promise<void> => {
-        // A second interaction that lands in the same tick as the winner: acknowledge it so its clicker
-        // is not left staring at a failure notice, and let the first answer stand.
-        if (settled) {
-          await acknowledge(interaction);
-          return;
-        }
-        settled = true;
-        cleanup();
-        await acknowledge(interaction);
-        // The answerer is rendered as a mention, not a raw snowflake: the channel's members are exactly
-        // who may answer, so the channel is where a name is the readable form.
-        await stripControls(posted, prompt, `${completed} (by <@${interaction.user.id}>)`);
-        resolve(answer);
-      };
-      waiters.set(posted.id, (interaction) => {
-        if (!interaction.customId.startsWith(MODAL_ID_PREFIX)) return;
-        const control = byId.get(interaction.customId.slice(MODAL_ID_PREFIX.length));
-        if (control?.kind !== "form") return;
-        void answerWith(
-          interaction,
-          new KatariData("discord.submitted", {
-            id: control.id,
-            values: submittedValues(interaction, control),
-            by: interaction.user.id,
-            display_name: displayNameOf(interactionNickname(interaction), interaction.user),
+      let posted: string;
+      try {
+        await gateway.ready;
+        posted = postedMessageId(
+          await rest.post(Routes.channelMessages(channel), {
+            body: { content: prompt, components: renderRows(rendered).map((row) => row.toJSON()) },
           }),
-          control.label,
+          "the question",
         );
-      });
-      collector.on("collect", (interaction: MessageComponentInteraction) => {
-        const control = byId.get(interaction.customId);
-        if (control === undefined) return;
-        if (interaction.isStringSelectMenu()) {
-          const option = interaction.values[0] ?? "";
+      } catch (error) {
+        // Rendering AND posting the question both sit inside this try, so neither a builder that refuses a
+        // control (a load-bearing string out of range) nor the platform rejecting the payload (a 26th
+        // dropdown option, a sixth row) can escape as anything but the declared `discord_error`, classified
+        // and raised exactly as discord_send does. `renderRows` belongs in here rather than above it for
+        // that reason: a builder's refusal is synchronous. A gateway that would not open is the same kind
+        // of failure — a bad token is `auth_error` — and lands here for the same reason.
+        katari.throw(new KatariData(discordErrorConstructor(error), { message: discordErrorMessage(error) }));
+        // `katari.throw` never returns; the rethrow only satisfies definite assignment on `posted`.
+        throw error;
+      }
+      // The wait: the FIRST COMPLETED interaction is the answer. No time limit — a decision may land hours
+      // later; a runtime restart interrupts the external call under the at-most-once rule. Clicking is not
+      // answering: opening a form's dialog and closing it again completes nothing, so the question stays
+      // open for the next attempt.
+      return await new Promise<KatariData<Record<string, unknown>>>((resolve, reject) => {
+        const byId = controlsById(rendered);
+        let settled = false;
+        const cleanup = () => {
+          gateway.questions.delete(posted);
+        };
+        /** Fail the ask with the declared `discord_error` (a `KatariThrowError` rejection becomes a typed
+         *  `throw` reply, not a panic), so a Discord call that breaks the question is catchable at the call
+         *  site rather than leaving it hanging on an answer that can no longer be given. */
+        const fail = (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          // The question is over either way, so its controls come off here too — same reason as the cancel
+          // path: nothing is waiting behind them.
+          void stripControls(rest, channel, posted, prompt, "(failed)");
+          reject(
+            new KatariThrowError(
+              new KatariData(discordErrorConstructor(error), { message: discordErrorMessage(error) }),
+            ),
+          );
+        };
+        /** Settle the ask with the answer this interaction completed. Never rejects: everything after the
+         *  answer is best effort, so `void`-ing a call cannot drop a failure. */
+        const answerWith = async (
+          interaction: MessageComponentInteraction | ModalSubmitInteraction,
+          answer: KatariData<Record<string, unknown>>,
+          completed: string,
+        ): Promise<void> => {
+          // A second interaction that lands in the same tick as the winner: acknowledge it so its clicker
+          // is not left staring at a failure notice, and let the first answer stand.
+          if (settled) {
+            await acknowledge(interaction);
+            return;
+          }
+          settled = true;
+          cleanup();
+          await acknowledge(interaction);
+          // The answerer is rendered as a mention, not a raw snowflake: the channel's members are exactly
+          // who may answer, so the channel is where a name is the readable form.
+          await stripControls(rest, channel, posted, prompt, `${completed} (by <@${interaction.user.id}>)`);
+          resolve(answer);
+        };
+        // One router per open question, fed by the gateway's single `InteractionCreate` listener: a
+        // component press and the dialog submit that follows one both arrive here, so the two halves of a
+        // `form` answer are read in one place.
+        gateway.questions.set(posted, (interaction) => {
+          if (interaction.isModalSubmit()) {
+            if (!interaction.customId.startsWith(MODAL_ID_PREFIX)) return;
+            const control = byId.get(interaction.customId.slice(MODAL_ID_PREFIX.length));
+            if (control?.kind !== "form") return;
+            void answerWith(
+              interaction,
+              new KatariData("discord.submitted", {
+                id: control.id,
+                values: submittedValues(interaction, control),
+                by: interaction.user.id,
+                display_name: displayNameOf(interactionNickname(interaction), interaction.user),
+              }),
+              control.label,
+            );
+            return;
+          }
+          const control = byId.get(interaction.customId);
+          if (control === undefined) return;
+          if (interaction.isStringSelectMenu()) {
+            const option = interaction.values[0] ?? "";
+            void answerWith(
+              interaction,
+              new KatariData("discord.chose", {
+                id: control.id,
+                option,
+                by: interaction.user.id,
+                display_name: displayNameOf(interactionNickname(interaction), interaction.user),
+              }),
+              option,
+            );
+            return;
+          }
+          if (!interaction.isButton()) return;
+          if (control.kind === "form") {
+            // BUILDING the dialog runs `@discordjs/builders`' validators, and a builder that refuses throws
+            // SYNCHRONOUSLY — so the build must not sit as the argument of `showModal`, where no `.catch` is
+            // attached yet: the throw would leave this router callback, and a throw that escapes an event
+            // handler settles nothing (the click does nothing, the controls stay live, the ask hangs) and on
+            // a sidecar without the port's process guard kills the process, failing every in-flight call as
+            // an uncatchable panic. Built here instead, a refusal is `fail`ed as the typed `api_error` a
+            // broken question is documented to become — including the refusals this package does not
+            // enumerate, a future discord.js check or a component count past a platform limit.
+            let dialog: ModalBuilder;
+            try {
+              dialog = renderModal(control);
+            } catch (error) {
+              fail(error);
+              return;
+            }
+            // Opening the dialog IS this click's acknowledgement, and it has to land within three seconds
+            // — the router fires as the click arrives, so there is time. A dialog Discord itself refuses
+            // is the platform rejecting the payload: fail the ask as `api_error` rather than leave it
+            // waiting on an answer that this control can no longer deliver.
+            void interaction.showModal(dialog).catch(fail);
+            return;
+          }
           void answerWith(
             interaction,
-            new KatariData("discord.chose", {
+            new KatariData("discord.clicked", {
               id: control.id,
-              option,
               by: interaction.user.id,
               display_name: displayNameOf(interactionNickname(interaction), interaction.user),
             }),
-            option,
+            control.label,
           );
-          return;
-        }
-        if (!interaction.isButton()) return;
-        if (control.kind === "form") {
-          // BUILDING the dialog runs `@discordjs/builders`' validators, and a builder that refuses throws
-          // SYNCHRONOUSLY — so the build must not sit as the argument of `showModal`, where no `.catch` is
-          // attached yet: the throw would leave this collector callback, and a throw that escapes an event
-          // handler settles nothing (the click does nothing, the controls stay live, the ask hangs) and on
-          // a sidecar without the port's process guard kills the process, failing every in-flight call as
-          // an uncatchable panic. Built here instead, a refusal is `fail`ed as the typed `api_error` a
-          // broken question is documented to become — including the refusals this package does not
-          // enumerate, a future discord.js check or a component count past a platform limit.
-          let dialog: ModalBuilder;
-          try {
-            dialog = renderModal(control);
-          } catch (error) {
-            fail(error);
-            return;
-          }
-          // Opening the dialog IS this click's acknowledgement, and it has to land within three seconds
-          // — the collector fires as the click arrives, so there is time. A dialog Discord itself refuses
-          // is the platform rejecting the payload: fail the ask as `api_error` rather than leave it
-          // waiting on an answer that this control can no longer deliver.
-          void interaction.showModal(dialog).catch(fail);
-          return;
-        }
-        void answerWith(
-          interaction,
-          new KatariData("discord.clicked", {
-            id: control.id,
-            by: interaction.user.id,
-            display_name: displayNameOf(interactionNickname(interaction), interaction.user),
-          }),
-          control.label,
-        );
-      });
-      // The runtime cancelled the call — a `time.with_deadline` expiry, a `region.cancel_by_id`, a run
-      // teardown. Since `ask` carries no timeout of its own, a deadline around it is the RECOMMENDED
-      // composition, which makes this the ordinary way a question ends: not a failure, so it settles as a
-      // plain cancellation and never as a typed `discord_error` — there is nothing here for the program to
-      // catch. The controls still come off, because a question nobody is waiting on any more must stop
-      // looking answerable.
-      context.signal.addEventListener("abort", () => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        // Launched, not awaited: this listener is synchronous, and a cancel must not wait on a cosmetic
-        // edit (nor break on one — `stripControls` swallows its own failure). The cancel settles now and
-        // the edit lands when Discord answers it.
-        void stripControls(posted, prompt, "(expired)");
-        // `KatariCancelledError` is the rejection the port expects from a handler unwinding on abort, and
-        // it confirms the cancel QUIETLY. A plain `Error` is confirmed too, but reported as "handler threw
-        // during cancellation" — which, since a deadline around `ask` is the recommended composition,
-        // would print a phantom diagnostic every time a question simply expired.
-        reject(new KatariCancelledError());
-      });
-    });
-  },
-);
-
-katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
-  "discord_watch",
-  ({ client, channel, deliver_to }, context) => {
-    const connection = connectionOf(client);
-    return new Promise<never>((_resolve, reject) => {
-      const listener = (message: {
-        author: { bot: boolean; id: string; globalName: string | null; username: string };
-        // `Message.member` is the guild member the author is in the channel's server, and null in a DM
-        // — where there is no server to hold a nickname. The chain below is total without it.
-        member: { nickname: string | null } | null;
-        channelId: string;
-        content: string;
-        attachments: Map<string, { url: string; contentType: string | null }>;
-      }) => {
-        if (message.author.bot || message.channelId !== channel) return;
-        // Deliver back into the runtime as an inner delegation; the callback's effects escalate
-        // through this call to the app's handlers. Attachments download from the CDN and lift into
-        // `file` values first (one that fails to download is dropped rather than failing the whole
-        // message). A delivery failure tears the watch down (the app's panic clause reports it).
-        void (async () => {
-          const files: KatariFile[] = [];
-          for (const attachment of message.attachments.values()) {
-            const response = await fetch(attachment.url);
-            if (!response.ok) continue;
-            const bytes = new Uint8Array(await response.arrayBuffer());
-            // The bytes' own word beats Discord's extension-derived claim; the claim stands only
-            // where the bytes prove nothing. A sniffed type also fills a NULL claim, so a proxied
-            // upload Discord never typed classifies as the image it is instead of as opaque bytes.
-            const contentType = sniffedContentType(bytes) ?? attachment.contentType ?? undefined;
-            files.push(
-              await context.file(bytes, {
-                ...(contentType === undefined ? {} : { contentType }),
-              }),
-            );
-          }
-          // One `message` data value, bound to the callback's single parameter: the delivered shape is
-          // named on both sides, so growing it later adds a field rather than shifting an argument.
-          await deliver_to.call({
-            value: new KatariData("discord.message", {
-              channel: message.channelId,
-              // The raw snowflake; the Katari side decides whether and how to hash it before it
-              // leaves the program.
-              author: message.author.id,
-              // The name beside the id, so an app CAN address a sender rather than only correlate
-              // them. Carried, never judged: whether a self-chosen name may cross to an AI provider
-              // is the app's call, and the type's doc is where it is told the name identifies nobody.
-              display_name: displayNameOf(message.member?.nickname ?? null, message.author),
-              text: message.content,
-              files,
-            }),
-          });
-        })().catch((error) => {
-          cleanup();
-          reject(error instanceof Error ? error : new Error(String(error)));
         });
-      };
-      const cleanup = () => connection.off(Events.MessageCreate, listener);
-      connection.on(Events.MessageCreate, listener);
-      // The runtime cancelled the call (run cancel / teardown): stop listening and settle. Rejected with
-      // the port's own `KatariCancelledError`, the type it expects from a handler unwinding on abort, so
-      // the cancel is confirmed quietly instead of being reported as "handler threw during cancellation".
-      // A delivery failure above stays an ordinary `Error` — that one IS a failure.
-      context.signal.addEventListener("abort", () => {
-        cleanup();
-        reject(new KatariCancelledError());
+        // The runtime cancelled the call — a `time.with_deadline` expiry, a `region.cancel_by_id`, a run
+        // teardown. Since `ask` carries no timeout of its own, a deadline around it is the RECOMMENDED
+        // composition, which makes this the ordinary way a question ends: not a failure, so it settles as a
+        // plain cancellation and never as a typed `discord_error` — there is nothing here for the program to
+        // catch. The controls still come off, because a question nobody is waiting on any more must stop
+        // looking answerable.
+        context.signal.addEventListener("abort", () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          // Launched, not awaited: this listener is synchronous, and a cancel must not wait on a cosmetic
+          // edit (nor break on one — `stripControls` swallows its own failure). The cancel settles now, the
+          // edit lands when Discord answers it, and it rides the token's REST client rather than the
+          // gateway this call is about to release.
+          void stripControls(rest, channel, posted, prompt, "(expired)");
+          // `KatariCancelledError` is the rejection the port expects from a handler unwinding on abort, and
+          // it confirms the cancel QUIETLY. A plain `Error` is confirmed too, but reported as "handler threw
+          // during cancellation" — which, since a deadline around `ask` is the recommended composition,
+          // would print a phantom diagnostic every time a question simply expired.
+          reject(new KatariCancelledError());
+        });
       });
-    });
+    } finally {
+      await releaseGateway(token, gateway);
+    }
   },
 );
 
-function connectionOf(handle: string): Client {
-  const connection = clients.get(handle);
-  if (connection === undefined) {
-    throw new Error(`unknown discord client handle: ${handle}`);
-  }
-  return connection;
-}
+katari.agent<{ token: string; channel: string; deliver_to: KatariAgent }>(
+  "discord_watch",
+  async ({ token, channel, deliver_to }, context) => {
+    // Leased and registered in the same tick, before anything is awaited: the socket cannot deliver a
+    // message this watch was not yet listening for.
+    const gateway = acquireGateway(token);
+    try {
+      return await new Promise<never>((_resolve, reject) => {
+        const watcher = (message: IncomingMessage) => {
+          if (message.author.bot || message.channelId !== channel) return;
+          // Deliver back into the runtime as an inner delegation; the callback's effects escalate
+          // through this call to the app's handlers. Attachments download from the CDN and lift into
+          // `file` values first (one that fails to download is dropped rather than failing the whole
+          // message). A delivery failure tears the watch down (the app's panic clause reports it).
+          void (async () => {
+            const files: KatariFile[] = [];
+            for (const attachment of message.attachments.values()) {
+              const response = await fetch(attachment.url);
+              if (!response.ok) continue;
+              const bytes = new Uint8Array(await response.arrayBuffer());
+              // The bytes' own word beats Discord's extension-derived claim; the claim stands only
+              // where the bytes prove nothing. A sniffed type also fills a NULL claim, so a proxied
+              // upload Discord never typed classifies as the image it is instead of as opaque bytes.
+              const contentType = sniffedContentType(bytes) ?? attachment.contentType ?? undefined;
+              files.push(
+                await context.file(bytes, {
+                  ...(contentType === undefined ? {} : { contentType }),
+                }),
+              );
+            }
+            // One `message` data value, bound to the callback's single parameter: the delivered shape is
+            // named on both sides, so growing it later adds a field rather than shifting an argument.
+            await deliver_to.call({
+              value: new KatariData("discord.message", {
+                channel: message.channelId,
+                // The raw snowflake; the Katari side decides whether and how to hash it before it
+                // leaves the program.
+                author: message.author.id,
+                // The name beside the id, so an app CAN address a sender rather than only correlate
+                // them. Carried, never judged: whether a self-chosen name may cross to an AI provider
+                // is the app's call, and the type's doc is where it is told the name identifies nobody.
+                display_name: displayNameOf(message.member?.nickname ?? null, message.author),
+                text: message.content,
+                files,
+              }),
+            });
+          })().catch((error) => {
+            cleanup();
+            reject(error instanceof Error ? error : new Error(String(error)));
+          });
+        };
+        const cleanup = () => gateway.watchers.delete(watcher);
+        gateway.watchers.add(watcher);
+        // A socket that never opens (a bad token, an unreachable API) fails the watch as the declared
+        // `discord_error`, classified auth vs api exactly as a send is — 0.6.0 raised this from the
+        // provider's login instead, which is why nothing connects there any more.
+        gateway.ready.catch((error: unknown) => {
+          cleanup();
+          reject(
+            new KatariThrowError(
+              new KatariData(discordErrorConstructor(error), { message: discordErrorMessage(error) }),
+            ),
+          );
+        });
+        // The runtime cancelled the call (run cancel / teardown): stop listening and settle. Rejected with
+        // the port's own `KatariCancelledError`, the type it expects from a handler unwinding on abort, so
+        // the cancel is confirmed quietly instead of being reported as "handler threw during cancellation".
+        // A delivery failure above stays an ordinary `Error` — that one IS a failure.
+        context.signal.addEventListener("abort", () => {
+          cleanup();
+          reject(new KatariCancelledError());
+        });
+      });
+    } finally {
+      await releaseGateway(token, gateway);
+    }
+  },
+);
