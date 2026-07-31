@@ -186,6 +186,15 @@ whatever marks it handled, and a forked-again watch can read the gap back with `
 (or while) it listens:
 
 ```katari
+import discord
+
+@"Whatever this bot does with one message; the point is that the gap runs through the SAME one the
+watch does, so a reconciled message cannot be treated differently from a delivered one."
+agent handle(message: discord.message) -> null with discord.credential | io | prelude.throw[discord.discord_error] {
+  let _posted = discord.send_message(channel = message.channel, text = f"seen: ${message.text}")
+  null
+}
+
 @"One page of the gap, handled oldest first; answers the cursor to read from next. Call it again while
 it keeps moving — an EMPTY page is the end, and a SHORT page is not, because dropped bot posts shorten
 one too."
