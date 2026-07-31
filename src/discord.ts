@@ -96,9 +96,12 @@ function restFor(token: string): REST {
   return rest;
 }
 
-/** The part of a gateway MESSAGE_CREATE this package reads, named so the fan-out below has a type to
- *  hand each watcher. */
+/** The part of a message this package reads, named so the fan-out below has a type to hand each
+ *  watcher — and so the gateway path and the REST history path cannot drift on what a
+ *  `discord.message` is made of. A gateway MESSAGE_CREATE satisfies it as delivered; a history page's
+ *  raw JSON is normalised into it by `historyMessages`. */
 interface IncomingMessage {
+  id: string;
   author: { bot: boolean; id: string; globalName: string | null; username: string };
   // The guild member the author is in the channel's server, and null in a DM — where there is no server
   // to hold a nickname. The display-name chain is total without it.
@@ -304,6 +307,139 @@ function postedMessageId(reply: unknown, what: string): string {
   }
   return id;
 }
+
+/** Every attachment of one message, downloaded from Discord's CDN and lifted into `file` values — the
+ *  half of a delivered message that costs bandwidth, shared by the gateway path and the history read so
+ *  a reconciled message carries exactly what a watched one carries. One attachment that fails to
+ *  download is DROPPED rather than failing the whole message: a message minus one image is still worth
+ *  handling, and the alternative (tearing the read down) loses the text as well. */
+async function downloadAttachments(
+  message: IncomingMessage,
+  context: { file: (bytes: Uint8Array, options: { contentType?: string }) => Promise<KatariFile> },
+): Promise<KatariFile[]> {
+  const files: KatariFile[] = [];
+  for (const attachment of message.attachments.values()) {
+    const response = await fetch(attachment.url);
+    if (!response.ok) continue;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    // The bytes' own word beats Discord's extension-derived claim; the claim stands only where the
+    // bytes prove nothing. A sniffed type also fills a NULL claim, so a proxied upload Discord never
+    // typed classifies as the image it is instead of as opaque bytes.
+    const contentType = sniffedContentType(bytes) ?? attachment.contentType ?? undefined;
+    files.push(
+      await context.file(bytes, {
+        ...(contentType === undefined ? {} : { contentType }),
+      }),
+    );
+  }
+  return files;
+}
+
+/** One `discord.message` data value. THE one place the delivered shape is spelled, so the gateway and
+ *  the history read cannot grow apart — a field added here reaches both paths or neither. */
+function messageValue(message: IncomingMessage, files: KatariFile[]): KatariData {
+  return new KatariData("discord.message", {
+    // The message's own id: what a caller keeps as a cursor and hands back to `list_messages`.
+    id: message.id,
+    channel: message.channelId,
+    // The raw snowflake; the Katari side decides whether and how to hash it before it leaves the
+    // program.
+    author: message.author.id,
+    // The name beside the id, so an app CAN address a sender rather than only correlate them. Carried,
+    // never judged: whether a self-chosen name may cross to an AI provider is the app's call, and the
+    // type's doc is where it is told the name identifies nobody.
+    display_name: displayNameOf(message.member?.nickname ?? null, message.author),
+    text: message.content,
+    files,
+  });
+}
+
+/** One history page's raw JSON, normalised into the shape the gateway path already delivers. The REST
+ *  payload is snake_case where the gateway object is camelCase, and its partial member calls the
+ *  nickname `nick`, so every field is read defensively: an entry this cannot read as a message is
+ *  dropped rather than delivered half-built. Discord answers NEWEST FIRST, so the caller reverses. */
+function historyMessages(payload: unknown): IncomingMessage[] {
+  if (!Array.isArray(payload)) return [];
+  const messages: IncomingMessage[] = [];
+  for (const entry of payload) {
+    const id = property(entry, "id");
+    const channelId = property(entry, "channel_id");
+    const author = property(entry, "author");
+    const authorId = property(author, "id");
+    if (typeof id !== "string" || typeof channelId !== "string" || typeof authorId !== "string") {
+      continue;
+    }
+    const globalName = property(author, "global_name");
+    const username = property(author, "username");
+    const nickname = property(property(entry, "member"), "nick");
+    const content = property(entry, "content");
+    const attachments = new Map<string, { url: string; contentType: string | null }>();
+    const rawAttachments = property(entry, "attachments");
+    if (Array.isArray(rawAttachments)) {
+      for (const attachment of rawAttachments) {
+        const url = property(attachment, "url");
+        if (typeof url !== "string") continue;
+        const contentType = property(attachment, "content_type");
+        const key = property(attachment, "id");
+        attachments.set(typeof key === "string" ? key : url, {
+          url,
+          contentType: typeof contentType === "string" ? contentType : null,
+        });
+      }
+    }
+    messages.push({
+      id,
+      author: {
+        bot: property(author, "bot") === true,
+        id: authorId,
+        globalName: typeof globalName === "string" ? globalName : null,
+        username: typeof username === "string" ? username : "",
+      },
+      member: typeof nickname === "string" ? { nickname } : null,
+      channelId,
+      content: typeof content === "string" ? content : "",
+      attachments,
+    });
+  }
+  return messages;
+}
+
+/** Discord's own cap on one `GET /channels/{id}/messages`, and the ONE place it is written: the Katari
+ *  side documents the clamp in prose and passes the caller's number through, so there is no second
+ *  copy to drift. */
+const HISTORY_PAGE_MAX = 100;
+
+katari.agent<{ token: string; channel: string; after: string; limit: number }>(
+  "discord_history",
+  async ({ token, channel, after, limit }, context) => {
+    try {
+      const asked = Number.isFinite(limit) ? Math.trunc(limit) : 1;
+      const query = new URLSearchParams({
+        limit: String(Math.min(Math.max(asked, 1), HISTORY_PAGE_MAX)),
+      });
+      // `after` is exclusive and Discord rejects an empty one, so an absent cursor simply omits it —
+      // which is the newest page, the shape a first run with nothing kept yet asks for.
+      if (after !== "") query.set("after", after);
+      const payload = await restFor(token).get(Routes.channelMessages(channel), { query });
+      // Newest first out of Discord, posted order out of here — a caller replaying a gap runs the
+      // messages through the same handling in the order they were written.
+      const page = historyMessages(payload).reverse();
+      const values: KatariData[] = [];
+      for (const message of page) {
+        // Bot posts are dropped exactly as the watch drops them, so one handler serves both paths.
+        if (message.author.bot) continue;
+        values.push(messageValue(message, await downloadAttachments(message, context)));
+      }
+      return values;
+    } catch (error) {
+      // Classified auth vs api by HTTP status, exactly as a send is: a token Discord rejects and a
+      // channel the bot cannot read are the operator's to fix, everything else is this call's bad luck.
+      katari.throw(new KatariData(discordErrorConstructor(error), { message: discordErrorMessage(error) }));
+      // `katari.throw` never returns; the rethrow only satisfies the declared return type.
+      throw error;
+    }
+  },
+);
 
 /** The multipart parts for a katari `file` list. Each file's bytes come over the blob side channel; the
  *  slim handle carries no metadata, so the MIME type rides in with the same download. */
@@ -851,36 +987,12 @@ katari.agent<{ token: string; channel: string; deliver_to: KatariAgent }>(
           // `file` values first (one that fails to download is dropped rather than failing the whole
           // message). A delivery failure tears the watch down (the app's panic clause reports it).
           void (async () => {
-            const files: KatariFile[] = [];
-            for (const attachment of message.attachments.values()) {
-              const response = await fetch(attachment.url);
-              if (!response.ok) continue;
-              const bytes = new Uint8Array(await response.arrayBuffer());
-              // The bytes' own word beats Discord's extension-derived claim; the claim stands only
-              // where the bytes prove nothing. A sniffed type also fills a NULL claim, so a proxied
-              // upload Discord never typed classifies as the image it is instead of as opaque bytes.
-              const contentType = sniffedContentType(bytes) ?? attachment.contentType ?? undefined;
-              files.push(
-                await context.file(bytes, {
-                  ...(contentType === undefined ? {} : { contentType }),
-                }),
-              );
-            }
             // One `message` data value, bound to the callback's single parameter: the delivered shape is
-            // named on both sides, so growing it later adds a field rather than shifting an argument.
+            // named on both sides, so growing it later adds a field rather than shifting an argument —
+            // and it is built by the same two helpers `discord_history` uses, so the stream and the gap
+            // read deliver the same thing.
             await deliver_to.call({
-              value: new KatariData("discord.message", {
-                channel: message.channelId,
-                // The raw snowflake; the Katari side decides whether and how to hash it before it
-                // leaves the program.
-                author: message.author.id,
-                // The name beside the id, so an app CAN address a sender rather than only correlate
-                // them. Carried, never judged: whether a self-chosen name may cross to an AI provider
-                // is the app's call, and the type's doc is where it is told the name identifies nobody.
-                display_name: displayNameOf(message.member?.nickname ?? null, message.author),
-                text: message.content,
-                files,
-              }),
+              value: messageValue(message, await downloadAttachments(message, context)),
             });
           })().catch((error) => {
             cleanup();

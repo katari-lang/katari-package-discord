@@ -79,6 +79,7 @@ type discord_error = auth_error | api_error
 names the fields it reads, has no argument order to get wrong, and keeps its signature when the
 delivered shape grows a field."
 data message(
+  @"This message's own id (a snowflake) — the same kind of value `send_message` returns, and the CURSOR `list_messages` reads after. Keep the id of the last message you handled and a gap can be closed later; drop it and the gateway's misses are unrecoverable, because Discord backfills nothing." id: string,
   @"The channel the message arrived on — hand it straight to `send_message` to reply in place." channel: string,
   @"The sender's raw Discord user id (a snowflake); see `watch_messages` on tagging it before it leaves the program." author: string,
   @"The name Discord's own client shows for the sender: their per-server nickname, else their global display name, else their username (total — a DM has no nickname to read, an account without a global name still has a username). SELF-CHOSEN, NOT UNIQUE, and NOT AN IDENTITY: anyone in a server may set their nickname to whatever another member's reads, so a matching name proves nothing about who spoke. @author@ is the identity — authorize on it (or on a tag derived from it), NEVER on this. Use this to ADDRESS someone, not to trust them." display_name: string,
@@ -96,6 +97,18 @@ external agent discord_send(
   @"The message text; empty means an attachments-only post." text: string,
   @"Files to attach to the post." files: array[file],
 ) -> string with prelude.throw[discord_error]
+
+@"Low-level: read a channel's recent messages with the bot @token@. A plain REST call — no gateway,
+nothing kept between calls — so it behaves identically before and after a restart. @limit@ is clamped
+into Discord's own 1-100 here, and the answer is reversed into POSTED ORDER (Discord answers newest
+first). Raises `auth_error` or `api_error` (`discord_error`) when the call fails. Prefer the
+list_messages agent."
+external agent discord_history(
+  @"The bot token to read with." token: string of private,
+  @"The channel to read." channel: string,
+  @"Read only messages posted after this message id; empty reads the newest page." after: string,
+  @"How many messages to ask Discord for; clamped into 1-100." limit: integer,
+) -> array[message] with prelude.throw[discord_error]
 
 @"Low-level: listen on a channel with the bot @token@ and deliver each incoming message as one
 `message` value to a callback. The sidecar opens the gateway socket for THIS CALL'S lifetime (shared
@@ -193,8 +206,10 @@ per-event acknowledgement, so a message can be MISSED: an invalidated session, a
 resume window, or this run restarting each re-identify, and Discord backfills nothing onto a fresh
 session. A message can also be REPEATED, though far more rarely: a resume replays from the last
 sequence the shard RECORDED, which it advances when an event ARRIVES rather than after @deliver_to@
-returns. No dedup memory is kept here. A bot that must miss nothing reconciles against the channel's
-own history rather than trusting this stream.
+returns. No dedup memory is kept here. A bot that must miss nothing does not trust this stream: it
+keeps the `id` of the last message it handled somewhere durable and closes the gap with
+`list_messages`, which reads the channel's own history from that id. The stream is the fast path; the
+cursor plus the read is the complete one.
 
 A runtime restart INTERRUPTS this call and costs nothing else, which is what changed in 0.7.0: the
 token is the whole of what the sidecar needs, so a re-forked watch opens a new socket and serves the
@@ -211,6 +226,38 @@ agent watch_messages[effect E](
   @"Called once per incoming message, with the whole message as one value; its effects E flow to the caller's handlers." deliver_to: agent (value: message) -> null with E,
 ) -> never with E | credential | io | prelude.throw[discord_error] {
   discord_watch(token = credential(), channel = channel, deliver_to = deliver_to)
+}
+
+@"THE GAP READER: a channel's messages posted after @after@, in POSTED ORDER — the reconciliation
+`watch_messages` tells you to write, and the durable half of \"miss nothing\". A gateway stream misses
+messages across a reconnect or a runtime restart and Discord backfills NOTHING onto a fresh session, so
+the only way back is a cursor you kept and a read that starts from it.
+
+@after@ is a message ID, not a timestamp: keep the `id` of the last message you handled (durably — a
+`var` dies with the run), hand it back here, and everything posted since arrives oldest first, ready to
+run through the same handling the watch would have run. An empty @after@ reads the newest @limit@
+instead, which is the shape for a first run with no cursor yet — the shape that does NOT reach back
+before the bot existed.
+
+The answer is the SAME `message` value the watch delivers, attachments downloaded into `file` values and
+this bot's own posts dropped, so one handler serves both paths and a reconciled message cannot quietly
+differ from a watched one. That download is what the symmetry costs: a page of image-heavy history pays
+for every attachment on it, so keep @limit@ to what you will actually process.
+
+READING A WIDE GAP TAKES SEVERAL CALLS. Discord caps one read at 100, so @limit@ is clamped into 1-100:
+read, handle, keep the last `id`, read again. A SHORT answer does not mean the gap is closed — dropped
+bot posts shorten it too — so the honest end condition is an EMPTY one. And nothing here dedups: a
+message already handled through the stream will be handed to you again if your cursor predates it, which
+is why the cursor belongs beside whatever marks a message handled.
+
+Raises `discord_error` exactly as `send_message` does: it is one REST call, and a bad token is
+`auth_error` on the first attempt."
+agent list_messages(
+  @"The channel to read." channel: string,
+  @"The message id to read after — the `id` of the last message you handled. Empty reads the newest @limit@ messages instead." after: string ?= "",
+  @"How many messages to ask Discord for; clamped into 1-100." limit: integer ?= 50,
+) -> array[message] with credential | io | prelude.throw[discord_error] {
+  discord_history(token = credential(), channel = channel, after = after, limit = limit)
 }
 
 // ── the interaction plane: the controls a question offers, and the answer one of them returns ────

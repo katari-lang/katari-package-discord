@@ -14,9 +14,14 @@ three pure helpers that need no credential at all.
   the next restart). It connects to nothing and closes nothing: a call that needs the gateway opens one
   for its own lifetime.
 - `discord.watch_messages(channel, deliver_to)` — serve a channel forever, delivering each incoming
-  message to your agent as one `discord.message(channel, author, display_name, text, files)` value.
+  message to your agent as one `discord.message(id, channel, author, display_name, text, files)` value.
   Bot posts (this bot's own replies included) are not delivered, so replying cannot loop. Never
   resolves; composes under `parallel [ … ]`. The callback's own argument is named `value` (0.6.0).
+- `discord.list_messages(channel, after ?= "", limit ?= 50) -> array[message]` — the channel's own
+  history after a message id, **in posted order** (0.8.0). The gateway misses messages across a
+  reconnect and backfills nothing, so this is the other half of "miss nothing": keep the `id` of the
+  last message you handled somewhere durable and read forward from it. Same `message` value the watch
+  delivers — attachments downloaded, bot posts dropped — so one handler serves both paths.
 - `discord.send_message(channel, text, files ?= [])` — post to a channel, returning the posted
   message's id; pass `[]` (or omit) for a plain text post.
 - `discord.try_send(channel, text, files ?= []) -> delivered | dropped(reason)` — the resilient
@@ -37,6 +42,24 @@ three pure helpers that need no credential at all.
   of the job that is arithmetic rather than editorial.
 - `discord.author_tag(source, author, length ?= 8) -> string` — the keyed pseudonym for a speaker's
   snowflake, so a user id can reach a model or a log without being a user id.
+
+## New in 0.8.0 — a delivered message has an id, and the gap has a reader
+
+`watch_messages` has always documented that a bot which must miss nothing "reconciles against the
+channel's own history". The package did not offer a way to do it, and a delivered message carried no
+id to reconcile *from*. Both are fixed:
+
+- **`discord.message` grew an `id`** — the message's own snowflake, the same kind of value
+  `send_message` returns. Additive: nothing in Katari constructs a `message`, and a `deliver_to` reads
+  the fields it names, so existing callbacks compile unchanged.
+- **`discord.list_messages(channel, after, limit)`** reads forward from that id, oldest first, one
+  REST call with no gateway involved. Discord caps a page at 100, so a wide gap takes several calls;
+  a SHORT answer is not proof the gap is closed (dropped bot posts shorten it too) — an EMPTY one is.
+- Nothing dedups. A message already handled through the stream comes back if your cursor predates it,
+  which is why the cursor belongs beside whatever marks a message handled.
+
+The shape and the attachment download are now written once in the sidecar and used by both paths, so a
+reconciled message cannot quietly differ from a watched one.
 
 ## Breaking changes in 0.7.0
 
@@ -156,6 +179,32 @@ What a restart *does* cost: the messages that arrive while nothing is watching (
 has, above), and an open `ask`'s posted controls, which nothing is left to strip — a late click gets
 Discord's own "interaction failed" notice, and the recovery is to ask again, since whoever wanted the
 answer wants it still.
+
+That first cost is the one a bot can choose to pay or not. The gap is real either way, but it is only
+*lost* if nothing recorded where the stream had got to. Store the `id` of each handled message beside
+whatever marks it handled, and a forked-again watch can read the gap back with `list_messages` before
+(or while) it listens:
+
+```katari
+@"One page of the gap, handled oldest first; answers the cursor to read from next. Call it again while
+it keeps moving — an EMPTY page is the end, and a SHORT page is not, because dropped bot posts shorten
+one too."
+agent catch_up_once(channel: string, since: string) -> string with discord.credential | io | prelude.throw[discord.discord_error] {
+  let page = discord.list_messages(channel = channel, after = since)
+  for (let message in page) {
+    next handle(message = message)
+  }
+  match (array.get(target = page, index = array.length(target = page) - 1)) {
+    case null -> since
+    case last -> last.id
+  }
+}
+```
+
+Whether that is worth it is the app's call, and the honest default is no: a community bot that misses a
+question during a redeploy is fine, and the asker repeats themselves. A bot whose channel is a WORK
+QUEUE is not fine, and for that one the cursor is the whole difference between at-most-once and
+at-least-once delivery.
 
 ## Who is speaking: an id, and a name that is not one
 
