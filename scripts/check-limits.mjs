@@ -3,8 +3,10 @@
 // `src/discord.ts` holds `LIMIT`, next to the render, because that is where a `@discordjs/builders`
 // predicate refuses a string and where the clamping has to happen. `src/discord.ktr` holds
 // `discord.limits()`, because a program that wants to check its own controls (`discord.check_controls`)
-// must be able to do it PURELY — at the point the controls are built, with no gateway connection and no
-// sidecar running. Nothing in Katari can read a constant out of the TypeScript, so the numbers are
+// or bound its own text (`string.fit(cap = discord.limits().message_text, …)`) must be able to do it
+// PURELY — at the point the controls are built, with no gateway connection and no sidecar running.
+// Publishing the numbers is what a platform package owes the prelude's general agents: `string.fit` can
+// cut to any budget, but only this package knows what Discord's budget IS. Nothing in Katari can read a constant out of the TypeScript, so the numbers are
 // duplicated; the alternative, an external agent that asks the sidecar, would turn reading a constant
 // into an io call and make the check need the very connection it exists to run without.
 //
@@ -43,7 +45,7 @@ const PAIRS = {
  *  `renderRows`) and meets them as a 400. They are exactly what `check_controls` adds over what an `ask`
  *  can fail on locally, so they are listed rather than paired. */
 const KATARI_ONLY = {
-  message_text: "how many characters one message's content may carry — Discord's own cap on the ask's PROMPT and on a send's text, which no builder checks and `check_controls` cannot see (it is not a control)",
+  message_text: "how many characters one message's content may carry — Discord's own cap on the ask's PROMPT and on a send's text, which no builder checks and `check_controls` cannot see (it is not a control). It is also the number a caller hands `string.fit` as its cap, now that the package's own `fit_message` has gone back to the prelude: publishing the number is what makes the prelude's general cut usable here",
   select_options: "how many options one dropdown may offer — Discord's own cap, checked by no builder",
   form_fields: "how many boxes one dialog may hold — Discord's own cap, checked by no builder",
   rows: "how many action rows one message may carry — Discord's own cap, checked by no builder",

@@ -1,51 +1,17 @@
-// The Discord library: a bot-token capability plus the two planes a chat surface has — MESSAGES
-// (in and out) and INTERACTIONS (one blocking question) — the Discord twin of the Slack package. The
-// externals are implemented in `discord.ts` (the same module path, so they register under `discord.*`).
-// The one-line integration is the provider:
-// `use discord.provider(source = credentials.env(key = "DISCORD_TOKEN"))`.
-//
-// EVERY EXTERNAL TAKES THE TOKEN, and nothing here carries a handle to a live connection. That is the
-// rule 0.7.0 was rebuilt on: a durable program may hold only durable values, and a pointer into the
-// sidecar's process memory is not one. A token plus a channel is a SELF-SUFFICIENT reference — any
-// process holding those two reaches the same channel — so a runtime restart costs the interrupted call
-// and nothing else: re-fork the watcher and it connects again. (0.6.0 served an opaque client handle
-// from a `connection` request, and a restart handed the program back a handle whose client was gone,
-// so every later call through it panicked and re-forking looped on the same dead handle.) The sidecar
-// still shares one gateway socket per token internally, refcounted, which no Katari value names and
-// nothing can observe.
-//
-// Files are first-class on both directions: an incoming message's attachments arrive as `file` values
-// (the sidecar downloads each and uploads it over the blob side channel), and `send_message` posts
-// `file` values back as Discord attachments.
-//
-// The interaction plane is ONE agent, `ask`: it posts a prompt with `control` values in front of it and
-// blocks for the `answer`. Approving an action, taking free-form text, editing a draft and picking from
-// a list are that same call with different DATA — not four agents with four contracts.
-//
-// This module is the Discord half of a TWIN CONTRACT with the `slack` package: the same data types with
-// the same fields and the same agents with the same argument names, so a bot ports between them by
-// swapping the import. THE COMPLETE LIST OF DIVERGENCES LIVES IN ONE PLACE — the slack package's README,
-// under "Divergences" — and is checked mechanically by `slack/scripts/check-twin.mjs`, which reads both
-// modules and fails on a shape either side grew without the other. A second copy of that list here is a
-// second copy that would go stale, which is what the twin contract was already losing to.
+// The Discord library: a bot-token capability, the message plane (in and out), and one blocking
+// question (`ask`). The externals are implemented in `discord.ts`.
+// Every call takes the token plus a channel and nothing holds a live connection, so a restart costs
+// the interrupted call and nothing else. Twin of the `slack` package, whose README lists the divergences.
 
-@"The Discord bot-token capability — provided at the root by `use discord.provider(...)`, resolved per
-call, so an env rotation or an oauth refresh lands without a restart. It is the WHOLE of what this
-package's calls need beside a channel: the token names the bot to Discord from any process, so nothing
-served here can be invalidated by a restart."
+@"The Discord bot-token capability, provided by `use discord.provider(...)` and resolved per call, so a
+token rotation lands without a restart."
 request credential() -> string of private
 
-@"Provide the Discord bot token for the extent of the continuation: serve `credential` from @source@,
-resolved at EVERY ask (the source is a NAME — where the token lives — never a value, so a rotation
-lands on the next call rather than on the next restart).
-
-NOTHING IS CONNECTED HERE and nothing is closed on the way out, which is what changed in 0.7.0. A call
-that needs the gateway (`watch_messages`, `ask`) opens one for its own lifetime inside the sidecar, so
-a bad token surfaces THERE — as `discord_error` from the call that wanted it — rather than at this
-install site, and this provider's only failures are the credential's own (`env.missing_secret` /
-`oauth.server_error`)."
+@"Provide the `credential` capability from @source@ for the extent of the continuation. @source@ is a
+name, not a value: resolution happens at each use. Nothing connects here, so a bad token surfaces at
+the call that wanted the gateway rather than at this install site."
 agent provider[R, effect E](
-  @"Where the bot token lives (env key or oauth name); resolved at each `credential` ask." source: credentials.source,
+  @"Where the bot token lives (env key or oauth name)." source: credentials.source,
   @"Runs with `credential` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, credential},
 ) -> R with E | io | prelude.throw[env.missing_secret | oauth.server_error] {
   use handler {
@@ -54,43 +20,35 @@ agent provider[R, effect E](
   continuation(value = null)
 }
 
-@"An authentication / authorization failure: the bot token is invalid or expired (HTTP 401), or the
-bot lacks permission in the channel (HTTP 403); @message@ carries Discord's error. The bot cannot
-recover on its own — the operator must fix the token or the bot's permissions. Let it surface so the
-bot stops loudly rather than silently dropping every reply. (A rotated token does not need a restart:
-every call resolves the credential afresh.)"
+@"An authentication or authorization failure: the bot token is invalid or expired (401), or the bot
+lacks permission in the channel (403); @message@ carries Discord's error. Only an operator can fix it,
+so let it surface rather than silently dropping every reply."
 data auth_error(message: string)
 
-@"A Discord API call failed for a non-auth reason: a rate limit (HTTP 429), a channel that is not a
-sendable text channel, a payload the platform rejects (a control past one of its caps), a transient
-network fault; @message@ carries Discord's error. Usually per-message or transient, so a bot catches it
-to drop just that reply and keep serving."
+@"A Discord API call failed for a non-auth reason: a rate limit (429), a channel that is not a sendable
+text channel, a payload the platform rejects, a transient network fault; @message@ carries Discord's
+error. Usually per-message or transient, so a bot can catch it to drop just that reply and keep serving."
 data api_error(message: string)
 
-// A Discord send failure: an auth/authorization failure or a plain API failure. Raised as a
-// `prelude.throw` (never a panic — that would tear the whole run down), classified in the sidecar by
-// the HTTP status. (Type synonyms take no docs.)
+// Raised as a `prelude.throw`, never a panic, and classified in the sidecar by HTTP status.
+// (Type synonyms take no docs, so this is a `//`.)
 type discord_error = auth_error | api_error
 
 // ── the message plane: what arrives, and what goes out ───────────────────────────────────────────
 
-@"One incoming message, as data: what arrived, where, from whom, and with what attached.
-`watch_messages` delivers ONE of these rather than a spread of positional arguments, so a @deliver_to@
-names the fields it reads, has no argument order to get wrong, and keeps its signature when the
-delivered shape grows a field."
+@"One incoming message: what arrived, where, from whom, and with what attached."
 data message(
-  @"This message's own id (a snowflake) — the same kind of value `send_message` returns, and the CURSOR `list_messages` reads after. Keep the id of the last message you handled and a gap can be closed later; drop it and the gateway's misses are unrecoverable, because Discord backfills nothing." id: string,
+  @"This message's own id (a snowflake) — the same kind of value `send_message` returns, and the cursor `list_messages` reads after. Keep the id of the last message you handled or a gap cannot be closed later, because Discord backfills nothing." id: string,
   @"The channel the message arrived on — hand it straight to `send_message` to reply in place." channel: string,
-  @"The sender's raw Discord user id (a snowflake); see `watch_messages` on tagging it before it leaves the program." author: string,
-  @"The name Discord's own client shows for the sender: their per-server nickname, else their global display name, else their username (total — a DM has no nickname to read, an account without a global name still has a username). SELF-CHOSEN, NOT UNIQUE, and NOT AN IDENTITY: anyone in a server may set their nickname to whatever another member's reads, so a matching name proves nothing about who spoke. @author@ is the identity — authorize on it (or on a tag derived from it), NEVER on this. Use this to ADDRESS someone, not to trust them." display_name: string,
+  @"The sender's raw Discord user id (a snowflake)." author: string,
+  @"The name Discord's own client shows for the sender: per-server nickname, else global display name, else username. Self-chosen and not unique, so it is not an identity — authorize on @author@ (or on a tag derived from it), never on this." display_name: string,
   @"The message text; empty for an attachments-only post." text: string,
   @"The attachments, already downloaded into `file` values." files: array[file],
 )
 
 @"Low-level: post to a channel with the bot @token@, with any files as attachments, returning the
-posted message's id. A plain REST call — no gateway, nothing kept between calls — so it behaves
-identically before and after a restart. Raises `auth_error` or `api_error` (`discord_error`) when the
-Discord API call fails. Prefer the send_message agent."
+posted message's id. A plain REST call, so it behaves identically before and after a restart. Raises
+`discord_error` when the call fails. Prefer the send_message agent."
 external agent discord_send(
   @"The bot token to post with." token: string of private,
   @"The channel to post into." channel: string,
@@ -98,11 +56,9 @@ external agent discord_send(
   @"Files to attach to the post." files: array[file],
 ) -> string with prelude.throw[discord_error]
 
-@"Low-level: read a channel's recent messages with the bot @token@. A plain REST call — no gateway,
-nothing kept between calls — so it behaves identically before and after a restart. @limit@ is clamped
-into Discord's own 1-100 here, and the answer is reversed into POSTED ORDER (Discord answers newest
-first). Raises `auth_error` or `api_error` (`discord_error`) when the call fails. Prefer the
-list_messages agent."
+@"Low-level: read a channel's recent messages with the bot @token@. A plain REST call. @limit@ is
+clamped into Discord's own 1-100 here, and the answer is reversed into posted order (Discord answers
+newest first). Raises `discord_error` when the call fails. Prefer the list_messages agent."
 external agent discord_history(
   @"The bot token to read with." token: string of private,
   @"The channel to read." channel: string,
@@ -111,23 +67,20 @@ external agent discord_history(
 ) -> array[message] with prelude.throw[discord_error]
 
 @"Low-level: listen on a channel with the bot @token@ and deliver each incoming message as one
-`message` value to a callback. The sidecar opens the gateway socket for THIS CALL'S lifetime (shared
-with any other live watch or ask on the same token, closed when the last of them ends) and attaches the
-listener before the socket comes up, so nothing that arrives on a fresh connection is delivered to
-nobody. Raises `discord_error` when the gateway will not open — an invalid token is `auth_error`.
-Prefer the watch_messages agent."
+`message` value to a callback. The sidecar opens the gateway socket for this call's lifetime (shared
+with any other live watch or `ask` on the same token, closed when the last of them ends) and attaches
+the listener before the socket comes up, so nothing arriving on a fresh connection is
+delivered to nobody. Raises `discord_error` when the gateway will not open. Prefer the watch_messages agent."
 external agent discord_watch[effect E](
   @"The bot token to listen with." token: string of private,
   @"The channel to listen on." channel: string,
   @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (value: message) -> null with E,
 ) -> never with E | prelude.throw[discord_error]
 
-@"Post a message to a channel with the ambient bot token, returning the posted MESSAGE'S ID —
-the composable seam a later edit / reaction / thread-reply agent will address a message by, so a
-caller that needs to refer back keeps it (and one that does not simply drops it). @files@ attach to
-the post. Raises `discord_error` (`auth_error` | `api_error`) when the send fails — catch `api_error`
-to keep a bot serving past a transient failure, and let `auth_error` surface so a bad token stops the
-bot loudly."
+@"Post a message to a channel with the ambient bot token, returning the posted message's id — the seam
+a later edit or thread-reply addresses a message by. @files@ attach to the post. Raises `discord_error`:
+catch `api_error` to keep a bot serving past a transient failure, and let `auth_error` surface so a bad
+token stops the bot loudly."
 agent send_message(
   @"The channel to post into." channel: string,
   @"The message text; empty means an attachments-only post." text: string,
@@ -136,38 +89,28 @@ agent send_message(
   discord_send(token = credential(), channel = channel, text = text, files = files)
 }
 
-@"A `try_send` that REACHED the channel: the message is posted. It carries nothing — a caller that
+@"A `try_send` that reached the channel: the message is posted. It carries nothing — a caller that
 wants the posted message's id wants `send_message` and its own error policy."
 data delivered()
 
-@"A `try_send` that posted NOTHING, with @reason@ saying which of the two silences it was: the
-transient `api_error` this agent swallowed (a rate limit, a channel the bot cannot post in, a channel
-id that names nothing), or a blank text with no files. It is a VALUE rather than a silence because a
-caller cannot tell the two apart from a `null`, and a program that reports \"posted\" for a post that
-never landed teaches whoever reads it — a person, or a model — something false."
+@"A `try_send` that posted nothing, with @reason@ saying which of the two silences it was: the
+transient `api_error` this agent swallowed, or a blank text with no files."
 data dropped(@"Why nothing was posted, in one clause." reason: string)
 
-// What became of one resilient post: it landed, or it did not and here is why. (Type synonyms take no docs.)
+// What became of one resilient post: it landed, or it did not and here is why.
 type send_outcome = delivered | dropped
 
-@"Post RESILIENTLY, fire-and-forget — the composition every long-lived bot writes around
-`send_message`, packaged: a blank @text@ with no @files@ posts nothing (a quiet protocol's silence);
-a transient `api_error` (a rate limit, an unsendable channel) drops just this post so the bot keeps
-serving; `auth_error` re-raises so a bad token still stops the bot loudly.
-
-IT ANSWERS WITH THE OUTCOME (`delivered` | `dropped(reason)`), which is the whole of what changed in
-0.5.0 and the reason it is a breaking change. The old `-> null` made the two endings indistinguishable
-from the outside, so every caller that reported on its own send reported SUCCESS for a post the channel
-never received — most damagingly a model-facing tool answering \"(posted)\" to an agent that then went
-on believing it had spoken. Dropping the post is still right (one bad send must not end a resident bot);
-dropping the FACT of it was not. The posted message's id is still not carried — a caller that needs it
-wants `send_message`."
+@"Post resiliently, fire-and-forget: a blank @text@ with no @files@ posts nothing, a transient
+`api_error` (a rate limit, an unsendable channel) drops just this post so the bot keeps serving, and
+`auth_error` re-raises so a bad token still stops the bot loudly. It answers with the outcome rather
+than a silence, so a caller cannot report success for a post the channel never received; the posted
+message's id is not carried."
 agent try_send(
   @"The channel to post into." channel: string,
   @"The message text; blank with no files posts nothing." text: string,
   @"Files to attach; defaults to none." files: array[file] ?= [],
 ) -> send_outcome {
-  if (string.is_blank(value = text) && array.length(target = files) == 0) {
+  if (string.trim(value = text) == "" && array.length(target = files) == 0) {
     dropped(reason = "the text was blank and no files were attached, so there was nothing to post")
   } else {
     use handler {
@@ -184,43 +127,20 @@ agent try_send(
   }
 }
 
-@"Serve a channel forever, delivering each incoming message to @deliver_to@ as one `message` value —
-shaped like `time.watch` / `google_calendar.watch` so it composes under `parallel [ … ]`. Bot posts
-(this bot's own replies included) are not delivered, so replying from @deliver_to@ cannot loop.
-@author@ on the delivered message is the sender's raw Discord user id (a snowflake — an ENUMERABLE
-numeric id, not a name); a plain digest of an enumerable id is dictionary-reversible, so pass it
-through `author_tag` before letting it leave the program, e.g. as an AI provider's abuse-attribution
-tag. That agent is this package's answer to a pseudonym every bot was otherwise writing (and getting
-wrong) for itself: keyed with `crypto.hmac_sha256` under a named secret, so the tag cannot be walked
-back to an account.
+@"Serve a channel forever, delivering each incoming message to @deliver_to@ as one `message` value;
+shaped like `time.watch` so it composes under `parallel [ … ]`. Bot posts (this bot's own replies
+included) are not delivered, so replying from @deliver_to@ cannot loop. Raises `discord_error` when the
+gateway will not open — opening it is this call's job, so an invalid token stops the watch as
+`auth_error` rather than failing the provider.
 
-@display_name@ beside it is the name Discord SHOWS for that sender, and it is not a second identity: a
-display name is SELF-CHOSEN and NOT UNIQUE — anyone in the server can set their nickname to read exactly
-like the operator's, and a public channel is precisely where a stranger will. So a program that decides
-what it may do from the name it was told has no authorization at all. Branch on @author@ (or on a tag
-derived from it) and treat @display_name@ as what it is: how to ADDRESS the speaker.
+Delivery is exactly once within one live gateway connection and guaranteed neither way across a
+reconnect or a runtime restart: the gateway has no per-event acknowledgement and Discord backfills
+nothing onto a fresh session, so a message can be missed, far more rarely repeated, and nothing here
+dedups. A bot that must miss nothing keeps the `id` of the last message it handled somewhere durable
+and closes the gap with `list_messages`.
 
-Delivery is exactly once WITHIN one live gateway connection, and NOT GUARANTEED either way across a
-reconnect — which is where this differs from the Slack twin's at-least-once. The gateway has no
-per-event acknowledgement, so a message can be MISSED: an invalidated session, an outage past the
-resume window, or this run restarting each re-identify, and Discord backfills nothing onto a fresh
-session. A message can also be REPEATED, though far more rarely: a resume replays from the last
-sequence the shard RECORDED, which it advances when an event ARRIVES rather than after @deliver_to@
-returns. No dedup memory is kept here. A bot that must miss nothing does not trust this stream: it
-keeps the `id` of the last message it handled somewhere durable and closes the gap with
-`list_messages`, which reads the channel's own history from that id. The stream is the fast path; the
-cursor plus the read is the complete one.
-
-A runtime restart INTERRUPTS this call and costs nothing else, which is what changed in 0.7.0: the
-token is the whole of what the sidecar needs, so a re-forked watch opens a new socket and serves the
-same channel again. (0.6.0 handed the re-fork the opaque client handle it was still carrying, whose
-client had died with the process, so every attempt panicked identically — a silent crash loop where a
-plain `region.crashed` → fork again now works.) What the interruption costs is the messages that arrive
-while nothing is watching, which is the reconnect gap above and not a new one.
-
-It RAISES `discord_error` (`auth_error` | `api_error`) when the gateway will not open, because opening
-it is now this call's job: `use discord.provider(...)` connects to nothing and so throws no
-`discord_error` at all. An invalid token stops the watch as `auth_error` on its first attempt."
+@author@ is an enumerable snowflake, so pass it through `crypto.pseudonym` before letting it leave the
+program. @display_name@ beside it is self-chosen and not unique: address with it, authorize on @author@."
 agent watch_messages[effect E](
   @"The channel to serve." channel: string,
   @"Called once per incoming message, with the whole message as one value; its effects E flow to the caller's handlers." deliver_to: agent (value: message) -> null with E,
@@ -228,30 +148,14 @@ agent watch_messages[effect E](
   discord_watch(token = credential(), channel = channel, deliver_to = deliver_to)
 }
 
-@"THE GAP READER: a channel's messages posted after @after@, in POSTED ORDER — the reconciliation
-`watch_messages` tells you to write, and the durable half of \"miss nothing\". A gateway stream misses
-messages across a reconnect or a runtime restart and Discord backfills NOTHING onto a fresh session, so
-the only way back is a cursor you kept and a read that starts from it.
+@"The channel's messages posted after @after@, in posted order — the reconciliation `watch_messages`
+needs across a reconnect. @after@ is a message id, not a timestamp: keep the `id` of the last message
+you handled durably and hand it back here; an empty @after@ reads the newest @limit@ instead.
 
-@after@ is a message ID, not a timestamp: keep the `id` of the last message you handled (durably — a
-`var` dies with the run), hand it back here, and everything posted since arrives oldest first, ready to
-run through the same handling the watch would have run. An empty @after@ reads the newest @limit@
-instead, which is the shape for a first run with no cursor yet — the shape that does NOT reach back
-before the bot existed.
-
-The answer is the SAME `message` value the watch delivers, attachments downloaded into `file` values and
-this bot's own posts dropped, so one handler serves both paths and a reconciled message cannot quietly
-differ from a watched one. That download is what the symmetry costs: a page of image-heavy history pays
-for every attachment on it, so keep @limit@ to what you will actually process.
-
-READING A WIDE GAP TAKES SEVERAL CALLS. Discord caps one read at 100, so @limit@ is clamped into 1-100:
-read, handle, keep the last `id`, read again. A SHORT answer does not mean the gap is closed — dropped
-bot posts shorten it too — so the honest end condition is an EMPTY one. And nothing here dedups: a
-message already handled through the stream will be handed to you again if your cursor predates it, which
-is why the cursor belongs beside whatever marks a message handled.
-
-Raises `discord_error` exactly as `send_message` does: it is one REST call, and a bad token is
-`auth_error` on the first attempt."
+The answer is the same `message` value the watch delivers, attachments downloaded and this bot's own
+posts dropped — a page of image-heavy history pays for every attachment on it, so keep @limit@ to what
+you will actually process. @limit@ is clamped into Discord's 1-100, so a wide gap takes several reads and an empty
+page, not a short one, marks it closed. Nothing dedups. Raises `discord_error` as `send_message` does."
 agent list_messages(
   @"The channel to read." channel: string,
   @"The message id to read after — the `id` of the last message you handled. Empty reads the newest @limit@ messages instead." after: string ?= "",
@@ -262,60 +166,53 @@ agent list_messages(
 
 // ── the interaction plane: the controls a question offers, and the answer one of them returns ────
 
-@"A clickable button: pressing it IS the answer (`clicked`), with no second step. @id@ returns
-verbatim, so a program branches on the id IT wrote rather than on the label a human reads — rename the
-label freely and every branch still holds. Discord caps a label at 80 characters, and this package
-SHORTENS a longer one (with a trailing `…`) rather than failing the question — a caption is
-presentation, so it never decides whether an ask is askable."
+@"A clickable button: pressing it is the answer (`clicked`), with no second step. @id@ returns
+verbatim, so a program branches on the id it wrote rather than on the label a human reads."
 data button(
-  @"The answer's identity; returned verbatim as `clicked.id`. At most 100 characters, and NOT shortened — it is how Discord routes the press back, so an over-long or blank one fails the ask as `api_error` instead of being silently altered into a key that could collide with a sibling's." id: string,
+  @"The answer's identity; returned verbatim as `clicked.id`. At most 100 characters and never shortened — it is how Discord routes the press back, so an over-long or blank one fails the ask as `api_error`." id: string,
   @"What the button reads on screen; at most 80 characters, shortened with `…` beyond that, and rendered as @id@ when blank." label: string,
 )
 
-@"A dropdown: picking one option IS the answer (`chose`), carrying the option's own text. Reach for it
-when the options are DATA the program computed (the open tickets, the matching files); a FIXED set of
-choices is clearer as one `button` each, because then every branch has an id the program named.
-Discord caps a dropdown at 25 options of 100 characters, and renders @label@ as the placeholder line
-shown while nothing is picked."
+@"A dropdown: picking one option is the answer (`chose`), carrying the option's own text. Reach for it
+when the options are data the program computed; a fixed set of choices is clearer as one `button` each,
+because then every branch has an id the program named. Discord takes at most 25 options of 100
+characters."
 data select(
-  @"The answer's identity; returned verbatim as `chose.id`. At most 100 characters, and NOT shortened — see `button`'s @id@." id: string,
+  @"The answer's identity; returned verbatim as `chose.id`. At most 100 characters and never shortened — see `button`'s @id@." id: string,
   @"The placeholder line shown while nothing is picked; at most 150 characters, shortened with `…` beyond that. Blank leaves Discord's own default line in place." label: string,
-  @"The options offered; the picked one returns as `chose.option`. Each is 1 to 100 characters and is NOT shortened: the option's own text IS the answer, so a clamped one would report a choice the program never offered — an over-long or blank option fails the ask as `api_error`." options: array[string],
+  @"The options offered; the picked one returns as `chose.option`. Each is 1 to 100 characters and is never shortened, since the option's own text is the answer: an over-long or blank one fails the ask as `api_error`." options: array[string],
 )
 
-@"One text box of a `form`: labelled, optionally prefilled, optionally multi-line. A PREFILLED box is
-how a draft gets edited — the human reads the program's proposal and submits it changed or unchanged,
-so the program never has to guess which parts were accepted. Discord caps a box's LABEL at 45
-characters (shortened here rather than fatal) and its @value@ at 4000 (not shortened — see below)."
+@"One text box of a `form`: labelled, optionally prefilled, optionally multi-line. A prefilled box is
+how a draft gets edited — the human submits the program's proposal changed or unchanged, so the program
+never has to guess which parts were accepted."
 data field(
-  @"The key this box's text lands under in `submitted.values`. At most 100 characters, and NOT shortened — it is the key the submitted text comes back under, so an over-long or blank one fails the ask as `api_error`." id: string,
+  @"The key this box's text lands under in `submitted.values`. At most 100 characters and never shortened, so an over-long or blank one fails the ask as `api_error`." id: string,
   @"What the box is labelled on screen; at most 45 characters, shortened with `…` beyond that, and rendered as @id@ when blank." label: string,
-  @"The text the box starts with — a draft to edit; defaults to empty. At most 4000 characters and NOT shortened: a submit means \"approved AT THESE VALUES\", so a draft quietly docked to fit would be approved as though it were whole — an over-long one fails the ask as `api_error`, for the program to shorten deliberately (or to post as a file and ask about instead)." value: string ?= "",
+  @"The text the box starts with — a draft to edit; defaults to empty. At most 4000 characters and never shortened, since a submit approves exactly these values: an over-long one fails the ask as `api_error`, for the program to shorten deliberately." value: string ?= "",
   @"Whether the box is a multi-line paragraph rather than one line; defaults to one line." multiline: boolean ?= false,
 )
 
-@"A form: a button that opens a dialog of @fields@, and SUBMITTING the dialog is the answer
+@"A form: a button that opens a dialog of @fields@, and submitting the dialog is the answer
 (`submitted`), carrying every field's text. Two steps because that is Discord's physics — text input
-exists only inside a dialog, and a dialog only opens in response to a click — so a form renders as one
-button reading @label@ above a dialog titled @title@. Opening the dialog and closing it again is NOT
-an answer: nothing was submitted, the question stays open, and any control (this one again, or a
-sibling) can still answer it. Discord takes 1 to 5 fields."
+exists only inside a dialog — so a form renders as one button reading @label@ above a dialog titled
+@title@. Opening the dialog and closing it again is not an answer: the question stays open and any
+control can still answer it. Discord takes 1 to 5 fields."
 data form(
-  @"The answer's identity; returned verbatim as `submitted.id`. At most 94 characters — six shorter than any other id, because the dialog's own identifier carries a prefix — and NOT shortened; an over-long or blank one fails the ask as `api_error` where the question POSTS, before a human is asked to press anything." id: string,
+  @"The answer's identity; returned verbatim as `submitted.id`. At most 94 characters — six shorter than any other id, because the dialog's own identifier carries a prefix — and never shortened; an over-long or blank one fails the ask as `api_error` where the question posts." id: string,
   @"What the opening button reads on screen; at most 80 characters, shortened with `…` beyond that, and rendered as @id@ when blank." label: string,
-  @"The dialog's title; keep it to 24 characters. That is the TWIN CONTRACT's bound, not Discord's own (Discord allows 45): a form written for one chat platform should render on the other, and Slack's dialog title caps at 24 — so the shared surface takes the lower of the two. Past 45 it is shortened with `…` here (Slack's twin rejects past 24 instead), and a blank title renders as @id@." title: string,
+  @"The dialog's title; keep it to 24 characters, which is the twin contract's bound rather than Discord's own 45, so a form written here also renders on the Slack twin. Past 45 it is shortened with `…`, and a blank title renders as @id@." title: string,
   @"The boxes the dialog presents, in order." fields: array[field],
 )
 
 // What a question may put in front of a human: an immediate button, a dropdown, or a form dialog.
-// (Type synonyms take no docs.)
 type control = button | select | form
 
 @"A `button` was pressed."
 data clicked(
   @"The pressed button's @id@." id: string,
   @"Who answered: their raw Discord user id (a snowflake)." by: string,
-  @"What the answerer is CALLED, resolved as `message`'s @display_name@ is — nickname, else global display name, else username. SELF-CHOSEN, NOT UNIQUE, and NOT AN IDENTITY: another member can wear the same name at will. @by@ is who answered; authorize on that, never on this." display_name: string,
+  @"What the answerer is called, resolved as `message`'s @display_name@ is. Self-chosen and not unique, so it is not an identity: authorize on @by@, never on this." display_name: string,
 )
 
 @"A `select`'s option was picked."
@@ -323,28 +220,27 @@ data chose(
   @"The dropdown's @id@." id: string,
   @"The picked option, verbatim from the `select`'s @options@." option: string,
   @"Who answered: their raw Discord user id (a snowflake)." by: string,
-  @"What the answerer is CALLED, resolved as `message`'s @display_name@ is — nickname, else global display name, else username. SELF-CHOSEN, NOT UNIQUE, and NOT AN IDENTITY: another member can wear the same name at will. @by@ is who answered; authorize on that, never on this." display_name: string,
+  @"What the answerer is called, resolved as `message`'s @display_name@ is. Self-chosen and not unique, so it is not an identity: authorize on @by@, never on this." display_name: string,
 )
 
 @"A `form` was submitted: @values@ carries every declared field's text, keyed by the field's @id@ (a
-box left blank is present as the empty string, so the record is total over the form's fields). What
-came back IS the decision, not a suggestion to re-derive: a submit means \"approved AT THESE VALUES\",
-so acting on @values@ acts on exactly what the human read and sent — the click and the deed cannot
-drift apart."
+box left blank is present as the empty string, so the record is total over the form's fields). A submit
+means approved at these values, so acting on @values@ acts on exactly what the human read and sent."
 data submitted(
   @"The submitted form's @id@." id: string,
   @"Each field's text, keyed by field id." values: record[string],
   @"Who answered: their raw Discord user id (a snowflake)." by: string,
-  @"What the answerer is CALLED, resolved as `message`'s @display_name@ is — nickname, else global display name, else username. SELF-CHOSEN, NOT UNIQUE, and NOT AN IDENTITY: another member can wear the same name at will. @by@ is who answered; authorize on that, never on this." display_name: string,
+  @"What the answerer is called, resolved as `message`'s @display_name@ is. Self-chosen and not unique, so it is not an identity: authorize on @by@, never on this." display_name: string,
 )
 
-// Which control completed the question, and with what. (Type synonyms take no docs.)
+// Which control completed the question, and with what.
 type answer = clicked | chose | submitted
 
 @"Low-level: post a prompt with its controls to a channel with the bot @token@ and await the first
-completed interaction. The sidecar brings the gateway socket up BEFORE the question posts (Discord
-delivers an interaction only to a session connected at the moment of the click) and lets it go when the
-question ends. Prefer the ask agent."
+completed interaction. The sidecar brings the gateway socket up before the question posts, because
+Discord delivers an interaction only to a session connected at the moment of the click; that socket is
+shared with any other live watch or `ask` on the same token and closes when the last of them ends.
+Prefer the ask agent."
 external agent discord_ask(
   @"The bot token to ask with." token: string of private,
   @"The channel to ask in." channel: string,
@@ -352,123 +248,66 @@ external agent discord_ask(
   @"The controls to present, in order." controls: array[control],
 ) -> answer with prelude.throw[discord_error]
 
-@"Post @prompt@ with @controls@ as ONE message and BLOCK until someone in the channel COMPLETES one of
-them, returning which control answered and with what — the human-in-the-loop step (approving an
-irreversible action, editing a draft before it goes out, choosing among candidates, taking a note).
-Those are not four agents: they are this call with different @controls@ data — two `button`s is an
-approval, a `form` of one empty `field` is free-form text, a `form` of PREFILLED fields is draft
-editing, a `select` is a pick from a computed list.
+@"Post @prompt@ with @controls@ as one message and block until someone in the channel completes one of
+them, returning which control answered and with what. Any member of the channel may answer and the
+first completed interaction is the answer; opening a form's dialog completes nothing.
 
-Ask in a channel whose MEMBERSHIP is the trust boundary: any member may answer, and the FIRST
-COMPLETED interaction is the answer. Merely opening a form's dialog completes nothing, so a curious
-click cannot consume the question. Once answered, the controls are stripped off the message and the
-outcome left in their place, so the channel keeps a readable record and a late click has nothing to
-press. A question that ends WITHOUT an answer is stripped the same way and left reading `(expired)`:
-an expiry, a cancel or a teardown never abandons live controls in the channel for someone to press
-into nothing. Stripping is best effort either way — if the edit itself fails the stale controls stay,
-and clicking one gets Discord's own \"interaction failed\" notice.
+Once answered — or ended without an answer, which leaves `(expired)` — the controls are stripped off the
+message and the outcome left in their place, best effort either way. That record reads as the control's
+own text (a `button`'s or `form`'s @label@, a `select`'s picked @option@) and names the answerer as a
+mention, while the @by@ the `answer` carries is the raw id.
 
-What that record READS is the control's own text — a `button`'s or `form`'s @label@, a `select`'s
-picked @option@ — so those strings are not merely what a human clicks: they become the channel's
-lasting, public account of what was decided. Write them as the audit line you would want to find
-later. The record names the answerer as a Discord MENTION (the channel renders it as a name), while
-the @by@ the `answer` carries is the raw id — the readable form is for the channel, the correlatable
-one for the program.
+`ask` holds no time limit: a deadline is `time.with_deadline` around it, a withdrawal is
+`region.cancel_by_id` on the fiber holding it. A runtime restart interrupts the wait under the
+at-most-once rule (a catchable panic) and leaves the posted controls stale, so a late click gets
+Discord's own \"interaction failed\" notice; ask again. Raises `discord_error` when opening the gateway
+(an invalid token is `auth_error`), posting the question, or opening a dialog fails.
 
-`ask` holds NO time limit, deliberately: a deadline is `time.with_deadline` wrapped around it and a
-withdrawal is `region.cancel_by_id` on the fiber holding it. One blocking question composes with
-both, whereas an expiry baked in here would make every caller handle a timeout it never asked for.
+A control past one of Discord's caps splits two ways: presentation is clamped (a @label@ or @title@ is
+shortened, a blank one renders as the control's @id@), while an @id@, a `select` option, a `field`
+@value@ and a count past `limits` fail the ask as `api_error`. `check_controls` answers all of that
+purely, where the controls are built.
 
-The wait rides one external call, so a runtime restart while it is open interrupts it under the
-at-most-once rule (a catchable panic) and the controls already in the channel go stale — nothing is left
-to strip them, so a late click gets Discord's own \"interaction failed\" notice. That is the DESIGNED
-outcome, not a defect to absorb here: let the panic ride to your supervisor and ASK AGAIN — whoever
-wanted the answer wants it still — rather than inventing an answer for an interaction that never landed.
-Asking again is the whole recovery as of 0.7.0: the new ask resolves the token and opens its own socket,
-with no connection left over from before to be dead.
-
-Raises `discord_error` when a Discord call fails: opening the gateway (an invalid token is `auth_error`),
-posting the question, or opening a form's dialog.
-
-A control past one of Discord's caps splits two ways, and the split is what stops a cosmetic string
-from being able to break a run. PRESENTATION is CLAMPED, never fatal: a `button`'s or `form`'s @label@
-past 80 characters, a `select`'s @label@ past 150, a `form`'s @title@ past 45 and a `field`'s @label@
-past 45 are shortened with a trailing `…`, and a BLANK one renders as the control's own @id@ (blank is
-just as illegal to Discord as over-long, so it needs a substitute either way). What CARRIES MEANING is
-CHECKED instead and fails the ask as `api_error`: an @id@ (at most 100 characters, 94 for a `form` —
-it is the routing key, and two shortened ids could collide and answer the wrong control), a `select`
-option (1 to 100 — the option's text IS the answer), and a `field`'s @value@ (at most 4000 — the draft
-a human submits as approved). Whatever this package cannot check locally is still the platform
-rejecting the payload and still `api_error`: a sixth row, a 26th option, a dialog past five fields.
-
-RUN `check_controls` WHERE THE CONTROLS ARE BUILT, not here. It answers every one of those caps —
-including the counts above and the duplicate @id@ neither side catches — as a VALUE, purely, with no
-credential and no connection needed: a gate's constructor can refuse itself before a run ever starts.
-It is not wired into this agent on purpose. `ask` returns an `answer` and has no room in that type for a verdict, so
-an internal check could only THROW — and a cosmetic string that can throw is the exact failure this
-package's clamping was written to remove. So the verdict stays a value, `ask` stays unchanged, and
-what a failed check means is the caller's decision.
-
-@by@ on the answer is the answerer's raw Discord user id (a snowflake — an ENUMERABLE numeric id, not
-a name); a plain digest of an enumerable id is dictionary-reversible, so pass it through `author_tag`
-before letting it leave the program. The @display_name@ beside
-it is what that answerer is CALLED, and a name is SELF-CHOSEN and NOT UNIQUE — a channel's other
-members can wear it too. A question whose answer depends on WHO gave it must read @by@; a name that
-decided anything would let whoever renamed themselves decide it instead."
+@by@ on the answer is an enumerable snowflake, so pass it through `crypto.pseudonym` before letting it
+leave the program. The @display_name@ beside it is self-chosen and not unique: an answer that depends on
+who gave it must read @by@."
 agent ask(
   @"The channel to ask in — its membership is who may answer." channel: string,
   @"The question posted above the controls." prompt: string,
-  @"What the human may complete: `button` / `select` / `form` values, rendered in order. Each control's @id@ must be DISTINCT within one ask — the id is the correlation key Discord carries back, so a repeat is unroutable rather than merely untidy (the sidecar keeps the first and warns). Discord fits at most 5 rows on a message: up to 5 buttons share a row, each dropdown takes one of its own. `check_controls` answers all of this as a value, before the question posts." controls: array[control],
+  @"What the human may complete: `button` / `select` / `form` values, rendered in order. Each control's @id@ must be distinct within one ask — the id is the correlation key Discord carries back, so a repeat is unroutable rather than merely untidy (the sidecar keeps the first and warns). Discord fits at most 5 rows on a message: up to 5 buttons share a row, each dropdown takes one of its own." controls: array[control],
 ) -> answer with credential | io | prelude.throw[discord_error] {
   discord_ask(token = credential(), channel = channel, prompt = prompt, controls = controls)
 }
 
 // ── the platform's numbers, and a local check against them ───────────────────────────────────────
 //
-// Every cap Discord enforces used to live in ONE place: the sidecar's renderer. So a program could
-// not ASK what a cap was, and learned what it had broken only where the payload was refused — at the
-// moment a human pressed a button, hours after the gate that built the control was written. `limits`
-// publishes the numbers as data and `check_controls` reads them, so "is this question askable?" is a
-// VALUE a program computes before the question posts, next to the code that built the controls.
-//
-// Both are PURE: no credential, no io, nothing to catch. A check that needed the gateway would be a
-// check nobody runs at construction time, which is the only time it is worth running.
+// Both are pure: no credential, no io, so they run where the controls are built rather than where they
+// are asked, which is the only time a check is worth running.
 
-@"Discord's limits on what ONE question may present, as data — the numbers this package's renderer
-clamps and checks against, published so a program can read them instead of rediscovering them from a
-refused payload. Lengths are in CHARACTERS; the renderer counts UTF-16 code units and Katari's
-`string.length` counts code points, so the two disagree by one per astral character (an emoji outside
-the BMP) — a control that sits within a couple of characters of its cap should be shortened rather
-than trusted to either count.
-
-Each field says what happens PAST it, because the split is the whole design (see `ask`): a
-presentation string is CLAMPED and a load-bearing one is FATAL. `check_controls` reports both, since
-a clamp is silent and a program that wanted its own words posted still wants to know."
+@"Discord's limits on what one question may present, as data. Lengths are in characters; the renderer
+counts UTF-16 code units and Katari's `string.length` counts code points, so the two disagree by one per
+astral character — shorten anything sitting within a couple of characters of its cap rather than
+trusting either count. Each field says what happens past it: a presentation string is clamped, a
+load-bearing one is fatal."
 data caps(
-  @"One MESSAGE's text: at most this many characters, FATAL past it. It is the cap on an `ask`'s @prompt@ (a question is one message) and on `send_message` / `try_send`'s @text@ — and it is the one number here that no control carries, which is why `check_controls` cannot see it: a caller building a prompt out of text it did not write must bound that text ITSELF, against this. Past it Discord refuses the whole post, so an over-long prompt is a question that can never be asked and therefore a gate that can never be granted." message_text: integer,
-  @"A `button`'s @label@ — and a `form`'s opening button's: at most this many characters, CLAMPED past it." button_label: integer,
-  @"A `select`'s @label@, the placeholder line: at most this many characters, CLAMPED past it. Blank is legal here alone — it leaves Discord's own default line." select_label: integer,
-  @"Each of a `select`'s @options@: 1 to this many characters, FATAL outside it — the option's text IS the answer." select_option: integer,
-  @"How many @options@ one `select` may offer: 1 to this many, FATAL outside it. The platform's own number, which no local builder checks." select_options: integer,
-  @"A `form`'s @title@: at most this many characters, CLAMPED past it. Discord's own number — the twin contract asks for 24, which is a convention rather than a cap (see `form`'s @title@)." form_title: integer,
-  @"How many `field` boxes one `form`'s dialog may hold: 1 to this many, FATAL outside it. The platform's own number, which no local builder checks — a sixth box passes every build and comes back a 400 when the operator clicks." form_fields: integer,
-  @"A `field`'s @label@: at most this many characters, CLAMPED past it." field_label: integer,
-  @"A `field`'s @value@, the prefilled draft: at most this many characters, FATAL past it — a submit means \"approved AT THESE VALUES\", so a docked draft would be approved as though it were whole. Blank is legal: it is the absence of a prefill." field_value: integer,
-  @"A `button`'s, `select`'s or `field`'s @id@: 1 to this many characters, FATAL outside it — it is the routing key, never presentation." control_id: integer,
-  @"A `form`'s @id@: 1 to this many characters, FATAL outside it. Shorter than @control_id@ because the form's DIALOG carries a prefix on the same identifier." form_id: integer,
-  @"How many rows of controls one message may carry, FATAL past it." rows: integer,
-  @"How many buttons share one row — the layout rule that decides how many of @rows@ a control list occupies: buttons pack this many to a row, and each `select` takes a row of its own." buttons_per_row: integer,
+  @"One message's text: at most this many characters, fatal past it. It caps an `ask`'s @prompt@ and `send_message` / `try_send`'s @text@, and it is the one number here that no control carries — so `check_controls` cannot see it, and a caller building a prompt out of text it did not write must bound that text itself against this." message_text: integer,
+  @"A `button`'s @label@ — and a `form`'s opening button's: at most this many characters, clamped past it." button_label: integer,
+  @"A `select`'s @label@, the placeholder line: at most this many characters, clamped past it. Blank is legal here alone — it leaves Discord's own default line." select_label: integer,
+  @"Each of a `select`'s @options@: 1 to this many characters, fatal outside it — the option's text is the answer." select_option: integer,
+  @"How many @options@ one `select` may offer: 1 to this many, fatal outside it." select_options: integer,
+  @"A `form`'s @title@: at most this many characters, clamped past it. Discord's own number — the twin contract asks for 24, which is a convention rather than a cap (see `form`'s @title@)." form_title: integer,
+  @"How many `field` boxes one `form`'s dialog may hold: 1 to this many, fatal outside it." form_fields: integer,
+  @"A `field`'s @label@: at most this many characters, clamped past it." field_label: integer,
+  @"A `field`'s @value@, the prefilled draft: at most this many characters, fatal past it — a submit approves exactly these values. Blank is legal: it is the absence of a prefill." field_value: integer,
+  @"A `button`'s, `select`'s or `field`'s @id@: 1 to this many characters, fatal outside it — it is the routing key, never presentation." control_id: integer,
+  @"A `form`'s @id@: 1 to this many characters, fatal outside it. Shorter than @control_id@ because the form's dialog carries a prefix on the same identifier." form_id: integer,
+  @"How many rows of controls one message may carry, fatal past it." rows: integer,
+  @"How many buttons share one row: buttons pack this many to a row, and each `select` takes a row of its own." buttons_per_row: integer,
 )
 
-@"Discord's caps, as one `caps` value — pure, so it costs nothing and composes anywhere (a gate
-builder, a test, an error message that wants to say what the bound was).
-
-These numbers are DUPLICATED, deliberately and visibly: the renderer that enforces them lives in the
-TypeScript sidecar, where the builders throw, and nothing in Katari can read a constant out of it.
-The duplicate is kept honest by `scripts/check-limits.mjs`, which fails when this agent and the
-sidecar's `LIMIT` disagree, so the two cannot drift apart in silence — the alternative (an external
-agent that asks the sidecar) would make reading a constant an io call, and a check that needs a live
-connection is a check nobody runs while writing the control."
+@"Discord's caps, as one `caps` value — pure, so it composes anywhere. These numbers are duplicated in
+the TypeScript sidecar's renderer, which nothing in Katari can read a constant out of;
+`scripts/check-limits.mjs` fails when this agent and the sidecar's `LIMIT` disagree."
 agent limits() -> caps {
   caps(
     message_text = 2000,
@@ -491,61 +330,39 @@ agent limits() -> caps {
 distinct, and nothing would be shortened or substituted on the way to the channel."
 data valid()
 
-@"Something about the controls will not reach the channel as written, and @reason@ names WHICH
-control and WHAT in one line — the first problem found, in declaration order, so a fix at a time
-converges."
+@"Something about the controls will not reach the channel as written, and @reason@ names which control
+and what in one line — the first problem found, in declaration order, so a fix at a time converges."
 data invalid(@"Which control, and what is wrong with it." reason: string)
 
 // The verdict `check_controls` returns: askable as written, or the first reason it is not.
-// (Type synonyms take no docs.)
 type control_check = valid | invalid
 
-@"Check @controls@ against Discord's caps LOCALLY and answer with a VALUE — `valid`, or `invalid`
-carrying one sentence naming the offending control. Pure: no credential, no io, nothing to catch, so
-it belongs where the controls are BUILT (a gate's constructor, a test) rather than where they are
-asked.
+@"Check @controls@ against Discord's caps locally and answer with a value — `valid`, or `invalid`
+carrying one sentence naming the offending control. Pure: no credential, no io, nothing to catch, so it
+belongs where the controls are built rather than where they are asked, and it is deliberately not wired
+into `ask`.
 
-It is deliberately NOT wired into `ask`, and that is the lesson of the outage this exists for. `ask`
-returns an `answer`; there is no room in that type for a verdict, so an internal check could only
-THROW — and a cosmetic string that can throw is exactly the failure mode this package spent a release
-removing (a 67-character label once restarted a resident system on every attempt). So the check is a
-separate agent whose result is data, `ask`'s behaviour is unchanged, and a caller decides what a
-failed check means: refuse the gate, shorten the label, log and ask anyway.
+What it reports is wider than what `ask` fails on, on purpose:
 
-What it reports is wider than what `ask` FAILS on, on purpose:
+- Fatal, as `ask` would be: a blank or over-long @id@, a blank or over-long `select` option, a count
+  outside `limits`' @select_options@ / @form_fields@ / @rows@, an over-long `field` @value@, and an
+  empty @controls@ (a question nobody can answer, which Discord posts happily).
+- Silent, which `ask` survives and a program still wants to know: a label, placeholder or title past
+  its cap is shortened, and a blank one renders as the control's own @id@ — so the channel's lasting
+  record of what was decided reads as an internal key, or as most of a sentence.
+- Duplicate ids, which nothing else catches at all: Discord returns the id and nothing more, so the
+  sidecar keeps the first and pressing the second control completes the first control's answer. A
+  `form`'s @fields@ are checked the same way, since `submitted.values` is keyed by field id.
 
-- FATAL, as `ask` would: a blank or over-long @id@, a blank or over-long `select` option, a dropdown
-  with no options or past `limits`' @select_options@, a dialog with no boxes or past @form_fields@,
-  an over-long `field` @value@, a control list that needs more than @rows@ rows, and an EMPTY
-  @controls@ (a question nobody can answer, which Discord posts happily).
-- SILENT, which `ask` survives and a program still wants to know: a label, placeholder or title past
-  its cap is SHORTENED with an ellipsis, and a blank one renders as the control's own @id@ — so the
-  channel's lasting record of what was decided reads as an internal key, or as most of a sentence.
-- DUPLICATE ids, which nothing else catches at all. Two controls sharing an @id@ cannot be told apart
-  on the way back: Discord returns the id and nothing more. The sidecar keeps the FIRST and warns, so
-  pressing the second control completes the first control's answer — \"deny\" answering as \"approve\".
-  A `form`'s @fields@ are checked the same way, since `submitted.values` is keyed by field id and two
-  boxes sharing one would collapse into a single entry.
-
-Lengths are counted in Unicode CODE POINTS while the renderer counts UTF-16 units, so an astral
-character (an emoji outside the BMP) is one here and two there; a string within a character or two of
-its cap should be shortened rather than argued about.
-
-```katari
-let controls = [discord.button(id = \"approve\", label = \"approve\"), discord.button(id = \"deny\", label = \"deny\")]
-match (discord.check_controls(controls = controls)) {
-  case discord.valid() -> discord.ask(channel = channel, prompt = prompt, controls = controls)
-  case discord.invalid(reason => reason) -> refuse_to_open_the_gate(why = reason)
-}
-```"
+Lengths are counted in code points while the renderer counts UTF-16 units, so an astral character is
+one here and two there."
 agent check_controls(
   @"The controls one `ask` would present, in the order it would render them." controls: array[control],
 ) -> control_check {
   let cap = limits()
 
-  // A PRESENTATION string, which the renderer repairs rather than refuses: blank is substituted with
-  // the control's own id and over-long is shortened with an ellipsis. Neither loses the run, and
-  // both are SILENT — so the report says what would be posted instead of what was written.
+  // A presentation string, which the renderer repairs rather than refuses: blank is substituted with
+  // the control's own id, over-long is shortened. Both are silent, so the report says what would be posted.
   agent clamped_label(where: string, what: string, value: string, allowed: integer) -> string {
     if (value == "") {
       f"${where}: ${what} is blank, so the control would be labelled with its own id"
@@ -556,8 +373,8 @@ agent check_controls(
     }
   }
 
-  // The one presentation string whose BLANK is meaningful: a `select` with no placeholder leaves
-  // Discord's own default line, which reads better than a substituted identifier.
+  // The one presentation string whose blank is meaningful: a `select` with no placeholder keeps
+  // Discord's own default line.
   agent optional_label(where: string, what: string, value: string, allowed: integer) -> string {
     if (string.length(value = value) > allowed) {
       f"${where}: ${what} is ${string.length(value = value)} characters where Discord takes ${allowed}, so it would be posted shortened with an ellipsis"
@@ -566,8 +383,8 @@ agent check_controls(
     }
   }
 
-  // A LOAD-BEARING string: an id, an option. Shortening it would change what the question MEANS, so
-  // the renderer refuses instead — blank as hard as over-long, and the ask fails as `api_error`.
+  // A load-bearing string: an id, an option. Shortening it would change what the question means, so the
+  // renderer refuses instead — blank as hard as over-long.
   agent fatal_string(where: string, what: string, value: string, allowed: integer) -> string {
     if (value == "") {
       f"${where}: ${what} is blank, which fails the ask as api_error"
@@ -578,8 +395,8 @@ agent check_controls(
     }
   }
 
-  // Load-bearing, but legitimately absent: a `field`'s prefill. Empty means \"no draft\"; over-long
-  // is fatal, because a draft docked to fit would be approved as though it were whole.
+  // Load-bearing, but legitimately absent: a `field`'s prefill. Empty means no draft; over-long is
+  // fatal, because a draft docked to fit would be approved as though it were whole.
   agent optional_text(where: string, what: string, value: string, allowed: integer) -> string {
     if (string.length(value = value) > allowed) {
       f"${where}: ${what} is ${string.length(value = value)} characters where Discord takes ${allowed}, which fails the ask as api_error"
@@ -588,8 +405,8 @@ agent check_controls(
     }
   }
 
-  // The first non-empty reason, or "" — "" is how every check above spells \"nothing wrong\", and no
-  // real reason is empty. First in declaration order wins, so a caller fixes one thing at a time.
+  // Every check above spells `nothing wrong` as the empty string, and no real reason is empty. First in
+  // declaration order wins, so a caller fixes one thing at a time.
   agent first_problem(problems: array[string]) -> string {
     for (let problem in problems, var found: string = "") {
       if (found == "" && problem != "") {
@@ -602,7 +419,6 @@ agent check_controls(
     }
   }
 
-  // A control's own id, whichever constructor it is — the correlation key, and how a report names it.
   agent id_of(control: control) -> string {
     match (control) {
       case button(id => id) -> id
@@ -611,7 +427,7 @@ agent check_controls(
     }
   }
 
-  // Whether the control takes a row of its own: Discord allows nothing beside a dropdown.
+  // Discord allows nothing beside a dropdown.
   agent takes_own_row(control: control) -> boolean {
     match (control) {
       case select(id => _) -> true
@@ -619,9 +435,8 @@ agent check_controls(
     }
   }
 
-  // Which control a reason is about. The id names it where there is one; a blank id has only its
-  // position, and the position is stated either way because two controls may share an id — which is
-  // itself one of the things reported.
+  // The position is stated even where there is an id, because two controls may share one — which is
+  // itself among the things reported.
   agent where_of(index: integer, id: string) -> string {
     if (id == "") {
       f"control #${index + 1}"
@@ -630,9 +445,8 @@ agent check_controls(
     }
   }
 
-  // How many rows these controls occupy, laid out exactly as the renderer lays them out: buttons pack
-  // `buttons_per_row` to a row, a `form` contributes the BUTTON that opens its dialog and so packs
-  // like any other, and a `select` flushes the pending buttons and takes a row alone.
+  // Laid out exactly as the renderer lays them out: a `form` contributes only the button that opens its
+  // dialog and so packs like any other, and a `select` flushes the pending buttons and takes a row alone.
   agent rows_used(controls: array[control]) -> integer {
     for (let control in controls, var rows: integer = 0, var pending: integer = 0) {
       if (takes_own_row(control = control)) {
@@ -655,8 +469,6 @@ agent check_controls(
     }
   }
 
-  // A dropdown's options: the COUNT the platform enforces and no local builder checks, then each
-  // option's own text, which is the answer itself and therefore never shortened.
   agent options_problem(where: string, options: array[string]) -> string {
     let count = array.length(target = options)
     if (count == 0) {
@@ -677,9 +489,8 @@ agent check_controls(
     }
   }
 
-  // A dialog's boxes: the COUNT (again the platform's, checked by nothing local), each box's strings,
-  // and the box ids' DISTINCTNESS — `submitted.values` is keyed by field id, so two boxes sharing one
-  // come back as a single entry and the other box's text is simply gone.
+  // Box ids must be distinct: `submitted.values` is keyed by field id, so two boxes sharing one come
+  // back as a single entry and the other box's text is simply gone.
   agent fields_problem(where: string, fields: array[field]) -> string {
     let count = array.length(target = fields)
     if (count == 0) {
@@ -687,7 +498,7 @@ agent check_controls(
     } else if (count > cap.form_fields) {
       f"${where}: the dialog has ${count} boxes; Discord takes 1 to ${cap.form_fields}"
     } else {
-      for (let box in fields, var at: integer = 0, var seen: record[boolean] = record.empty(), var found: string = "") {
+      for (let box in fields, var at: integer = 0, var seen: record[boolean] = {}, var found: string = "") {
         let what = f"box #${at + 1}"
         let duplicate = if (box.id != "" && record.has(target = seen, key = box.id)) {
           f"${where}: ${what} repeats the field id \"${box.id}\", so both boxes would come back as one entry of submitted.values"
@@ -711,8 +522,7 @@ agent check_controls(
     }
   }
 
-  // One control's own strings, in the order a reader would want them: the id first (it decides
-  // whether the control can be routed at all), then what a human reads.
+  // The id first: it decides whether the control can be routed at all.
   agent control_problem(where: string, control: control) -> string {
     match (control) {
       case button(id => id, label => label) -> first_problem(problems = [
@@ -736,11 +546,11 @@ agent check_controls(
   if (array.length(target = controls) == 0) {
     invalid(reason = "no controls: Discord posts the prompt happily and the question can never be answered")
   } else {
-    for (let control in controls, var at: integer = 0, var seen: record[boolean] = record.empty(), var found: string = "") {
+    for (let control in controls, var at: integer = 0, var seen: record[boolean] = {}, var found: string = "") {
       let id = id_of(control = control)
       let where = where_of(index = at, id = id)
-      // A blank id is reported by `control_problem` as the fatal thing it is, so it is not ALSO
-      // reported as a duplicate of the previous blank one — the first report is the actionable one.
+      // A blank id is already reported by `control_problem` as the fatal thing it is, so it is not also
+      // reported as a duplicate of the previous blank one.
       let duplicate = if (id != "" && record.has(target = seen, key = id)) {
         f"${where}: two controls share this id, and Discord carries back nothing else — the first one keeps it, so completing this control would answer as the first"
       } else {
@@ -762,85 +572,4 @@ agent check_controls(
       }
     }
   }
-}
-
-@"Shorten @text@ so it fits in ONE Discord message, ending it with @marker@ when anything was cut —
-the arithmetic every caller was doing against `limits()` by hand, and the half of that job which is
-mechanical rather than editorial.
-
-WHY IT IS NOT MERELY A SLICE. Past `limits()`'s @message_text@ Discord REFUSES the post rather than
-shortening it, so an over-long prompt is a question that can never be asked (a gate that can never be
-granted, failing identically on every retry) and an over-long reply is a message that never lands. The
-room is therefore @message_text@ MINUS the marker's own length, because the marker is part of what gets
-posted — measuring the text, cutting it to the cap and appending afterwards is the one way this is got
-wrong, and it puts the result back over the cap every time.
-
-WHY THE MARKER IS YOURS. Only the caller knows what the reader needs told, but SOMETHING must be told:
-text that was silently docked reads exactly like text that ended, and a model reading it will answer
-from a fragment as though it had the whole. Write the marker as the FACT — \"… (cut: the first 1,900 of
-7,400 characters)\" — rather than as a bare ellipsis, so whoever reads it knows to ask for the rest.
-
-Text that already fits comes back UNCHANGED, with no marker, so this is safe to wrap around everything.
-A @marker@ that alone exceeds the cap leaves no room for any text and comes back cut to the cap itself:
-the one guarantee here is that the result fits.
-
-Lengths are Katari code points and Discord counts UTF-16 units, so text within a couple of characters of
-the cap should be given a longer marker rather than trusted to either count."
-agent fit_message(
-  @"The text to fit; returned unchanged when it already does." text: string,
-  @"What to end the result with when anything was cut — your own words, saying that it was cut and ideally by how much." marker: string,
-) -> string {
-  let cap = limits().message_text
-  if (string.length(value = text) <= cap) {
-    text
-  } else {
-    let room = cap - string.length(value = marker)
-    if (room <= 0) {
-      string.slice(value = marker, start = 0, end = cap)
-    } else {
-      f"${string.slice(value = text, start = 0, end = room)}${marker}"
-    }
-  }
-}
-
-// ── the speaker, pseudonymised ───────────────────────────────────────────────────────────────────
-
-@"Tag a Discord user id into a short, stable PSEUDONYM — the ~25 lines every bot that lets a speaker
-reach a model or a log was writing for itself, with the same one way to get it wrong.
-
-WHY NOT A PLAIN DIGEST. A snowflake is an ENUMERABLE numeric id: it is a timestamp, a worker, a
-process and a counter, so the space a real id lives in is small enough to walk. `crypto.sha256` of
-one is therefore reversible by dictionary — anyone holding the digest hashes candidate snowflakes
-until one matches, and the pseudonym is a user id again. `crypto.hmac_sha256` under a secret KEY has
-no such attack: without the key there is nothing to hash candidates with. That is the whole
-difference between a pseudonym and an obfuscation, and it is one function call wide, which is exactly
-why it kept being got wrong.
-
-WHAT COMES OUT is safe to SHOW: @length@ hex characters (8 by default — 32 bits, opaque and short
-enough to sit inline in a prompt or a log line), stable for as long as the key is, and meaningless to
-anyone without the key. Rotating the key rotates every pseudonym, which is the intended way to sever
-a correlation. Keep @length@ generous if the tag must be UNIQUE rather than merely readable: 8 hex
-characters collide at around 2^16 distinct speakers by the birthday bound, so a full 64 is what a
-program correlating abuse reports across a large server should carry, and a short one is what it
-shows. The result is deliberately PUBLIC despite the private key — an HMAC reveals nothing about its
-key, which is the sound declassification `crypto.hmac_sha256` documents.
-
-THE KEY is named, not passed: a `credentials.source` (`credentials.env(key = ...)` or
-`credentials.oauth(name = ...)`), so the secret's VALUE never enters the app's dataflow. It resolves
-at EVERY call, like every other credential use in Katari, so a rotated key lands without a restart —
-a bot tagging every message pays one credential read per message for that. Any secret with a stable
-lifetime will do; the bot's own token is the usual choice, since it already exists and dies with the
-bot's identity.
-
-WHAT IT IS NOT is an anonymisation. A pseudonym is stable by construction, so it links everything one
-person ever said; what it removes is the ability to turn that link back into an account. Whether even
-a pseudonymous link may cross to an AI provider is the app's judgement, exactly as with
-`display_name` — this agent only makes the tag correct."
-agent author_tag(
-  @"Where the pseudonym key lives (an env key or an oauth credential name); resolved at each call, never held." source: credentials.source,
-  @"The raw Discord user id to tag: a `message`'s @author@, or an `answer`'s @by@." author: string,
-  @"How many hex characters to keep, from 1 to 64 (the full tag); defaults to 8 — short enough to read, wide enough to tell a channel's speakers apart. Out of range is clamped into it." length: integer ?= 8,
-) -> string with io | prelude.throw[env.missing_secret | oauth.server_error] {
-  let tagged = crypto.hmac_sha256(key = credentials.resolve(source = source), text = author)
-  string.slice(value = tagged, start = 0, end = math.max(left = 1, right = math.min(left = length, right = 64)))
 }

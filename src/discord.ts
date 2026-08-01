@@ -1,29 +1,15 @@
-// The sidecar half of `discord.ktr` — a discord.js REST client for what Discord can be TOLD, and a
-// gateway socket for what it has to be LISTENED to for. Handlers register under this file's module path
-// (`discord.*`).
+// The sidecar half of `discord.ktr`: a discord.js REST client for what Discord can be told, and a
+// gateway socket for what it has to be listened to for. Handlers register under this file's module
+// path (`discord.*`).
 //
-// EVERY HANDLER TAKES THE BOT TOKEN, and no Katari value names anything in this process. That is the FFI
-// rule 0.7.0 was rebuilt on: a durable program may hold only durable values, and a handle into this
-// module's memory is not one. 0.6.0's registry (`const clients = new Map()`, keyed by an opaque handle
-// the program carried around) handed a RESTARTED runtime a handle whose client was gone, so every call
-// through it failed — and its own comment called an unknown handle "a program defect", which was exactly
-// the mistake: a restart produces one legitimately, and no amount of care in the program prevents it.
+// Every handler takes the bot token and no Katari value names anything in this process, so both caches
+// below are keyed by the token and pointed at by nothing. `discord_watch` / `discord_ask` lease one
+// gateway per token, refcounted and closed when the last of them ends; a restart comes up with an empty
+// cache and the calls that held it were already dead.
 //
-// So both caches below are keyed by the TOKEN and pointed at by nothing. `discord_send` is a plain REST
-// call with no state at all: a token and a channel name the remote thing from any process, which is the
-// whole of self-sufficiency. `discord_watch` / `discord_ask` need a live socket to RECEIVE, so they lease
-// one per token — refcounted, closed when the last of them ends. A restart loses the interrupted call
-// (at-most-once, unavoidable), the cache comes up empty, and the calls that held it were already dead:
-// re-fork the watcher and it connects again.
-//
-// Files cross in both directions: an outgoing message's `file` values download over the blob side
-// channel and attach to the Discord post; an incoming message's attachments download from Discord's
-// CDN and upload over the same side channel, so the delivered message carries real `file` values.
-//
-// `discord_ask` is where Discord's physics show through: a message may carry buttons and dropdowns but
-// NO text input, and text input exists only in a modal dialog, which the platform opens only in reply
-// to a click. So a katari `form` control renders as a button that opens the dialog — two Discord steps
-// behind one katari answer.
+// A message may carry buttons and dropdowns but no text input, and text input exists only in a modal
+// dialog that Discord opens only in reply to a click — so a katari `form` renders as a button that
+// opens the dialog: two Discord steps behind one katari answer.
 
 import {
   katari,
@@ -83,9 +69,8 @@ function discordErrorConstructor(error: unknown): string {
 
 // ─── the two caches: a token's REST client, and a token's gateway socket ───────────────────────────
 
-/** The REST client for a bot token — the whole of what a stateless call needs. Cached to reuse the
- *  connection pool and the route rate-limit buckets, and for NO other reason: a fresh one behaves
- *  identically, so nothing observable rides on this map and a restart that empties it changes nothing. */
+/** The REST client for a bot token. Cached to reuse the connection pool and the route rate-limit
+ *  buckets, and for no other reason: a fresh one behaves identically. */
 const restClients = new Map<string, REST>();
 
 function restFor(token: string): REST {
@@ -139,14 +124,10 @@ const gateways = new Map<string, Gateway>();
 
 /** Lease the gateway socket for `token`, opening one if this is the first caller.
  *
- *  SYNCHRONOUS on purpose. The caller registers itself on the returned gateway before awaiting `ready`,
- *  so there is no window in which this package is connected and receiving events that a caller asked
- *  for but is not yet listening for. 0.6.0 had exactly that window — `create_discord_client` logged in,
- *  and `discord_watch` attached its listener some later call afterwards — and every message that
- *  arrived in between was lost with nothing reporting it.
- *
- *  A login FAILURE evicts the entry and abandons the client, so the next call opens a fresh socket
- *  rather than inheriting a cached rejection. */
+ *  Synchronous on purpose: the caller registers itself on the returned gateway before awaiting `ready`,
+ *  so there is no window in which this package is connected and receiving events nobody is listening
+ *  for. A login failure evicts the entry, so the next call opens a fresh socket rather than inheriting
+ *  a cached rejection. */
 function acquireGateway(token: string): Gateway {
   const existing = gateways.get(token);
   if (existing !== undefined) {
@@ -270,18 +251,11 @@ function matchesSignature(bytes: Uint8Array, offset: number, signature: number[]
   );
 }
 
-/** The content type the BYTES prove, or undefined when they prove nothing. Discord types an
- *  attachment by its filename EXTENSION and never reads the bytes, so its `contentType` is exactly
- *  as true as the uploader's filename: a PNG saved as `photo.webp` arrives declared `image/webp`.
- *  An AI provider downstream checks the actual bytes against the declared media type and rejects
- *  the whole request on a mismatch — a rejection the conversation then repeats on every later call,
- *  because history is re-sent whole. The bytes are already in hand at the download, so proving the
- *  type here costs nothing and corrects the record once, for every consumer.
- *
- *  The signatures are the unmistakable AND consequential ones — the four image types providers
- *  inline plus PDF, the exact set whose declared media type is byte-checked against the content.
- *  Anything else keeps Discord's word: a text file has no magic number, and a wrong text subtype is
- *  not byte-checked by anyone. */
+/** The content type the bytes prove, or undefined when they prove nothing. Discord types an attachment
+ *  by its filename extension and never reads the bytes, so a PNG saved as `photo.webp` arrives declared
+ *  `image/webp` — and an AI provider downstream byte-checks the declared media type and rejects the
+ *  whole request on a mismatch. The signatures covered are exactly that byte-checked set: the four
+ *  inlined image types plus PDF. Anything else keeps Discord's word. */
 function sniffedContentType(bytes: Uint8Array): string | undefined {
   if (matchesSignature(bytes, 0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "image/png";
   if (matchesSignature(bytes, 0, [0xff, 0xd8, 0xff])) return "image/jpeg";
@@ -541,8 +515,7 @@ function formFields(fields: unknown, key: string): FormField[] {
 
 /** Read one decoded `control` value. An unrecognised constructor means the wire disagrees with the
  *  schema the compiler checked, which is a defect rather than an execution failure — so it stays a bare
- *  throw (a panic). Nothing else in this file throws bare any more: the one other place that did was the
- *  handle lookup, whose "defect" a restart produced by itself. */
+ *  throw (a panic). */
 function readControl(value: unknown): Control {
   const fields = value instanceof KatariData ? value.value : undefined;
   const name = value instanceof KatariData ? value.name : "";
@@ -571,17 +544,12 @@ function readControl(value: unknown): Control {
 
 // ─── the caps the builders enforce, and what this package does with each ──────────────────────────
 
-/** What `@discordjs/builders` refuses, read off the predicates in its `dist/index.js` (1.14.1) rather
- *  than recalled: every string this package renders goes through an `s.string()` with a maximum, and all
- *  but the two noted below also demand at least ONE character — so a BLANK string is as fatal as a long
- *  one. The numbers live here, next to the render, because a builder that refuses throws where the throw
- *  can leave the interaction handler entirely, and nothing about a caption should be able to decide
- *  whether a run survives.
+/** What `@discordjs/builders` refuses, read off the predicates in its `dist/index.js` (1.14.1): every
+ *  string this package renders goes through an `s.string()` with a maximum, and all but the two noted
+ *  below also demand at least one character, so a blank string is as fatal as a long one.
  *
- *  EVERY NUMBER HERE IS ALSO PUBLISHED FROM KATARI, by `discord.limits()` in `discord.ktr`, so a program
- *  can check its own controls (`discord.check_controls`) without a connection. Nothing in Katari can read
- *  a constant out of this file, so the two copies are kept equal by `scripts/check-limits.mjs`, which
- *  fails when they disagree: change a number here and change it there, or the check says so. */
+ *  Every number here is also published from Katari by `discord.limits()`. Nothing in Katari can read a
+ *  constant out of this file, so `scripts/check-limits.mjs` fails when the two copies disagree. */
 const LIMIT = {
   /** `buttonLabelValidator`: 1–80. A `form`'s opening button reads through here too. */
   buttonLabel: 80,
@@ -740,18 +708,13 @@ async function acknowledge(
   }
 }
 
-/** Take the controls away and leave @outcome@ in their place, so the channel keeps a readable record and
- *  a late click has nothing to press. EVERY way a question ends comes through here — an answer, a failure,
- *  and a cancel — because a question that has stopped mattering must stop looking answerable: live
- *  controls on a dead ask offer nothing but the platform's bare "interaction failed".
+/** Take the controls away and leave @outcome@ in their place, so a late click has nothing to press.
+ *  Every way a question ends comes through here — an answer, a failure, a cancel.
  *
- *  Edited over REST with the BOT token rather than through the interaction, for two reasons that point
- *  the same way: an interaction's token expires fifteen minutes after it was issued while a bot's edit
- *  never does (and a dialog may be submitted long after the click that opened it, while a cancel arrives
- *  with no interaction in hand at all), and a REST call outlives the gateway lease the ask is giving up.
- *
- *  Best effort, for the same reason `acknowledge` is: on the answer path a decision must not be lost to a
- *  cosmetic edit, and on the cancel path a cosmetic edit must not break the cancel. */
+ *  Edited over REST with the bot token rather than through the interaction: an interaction's token
+ *  expires fifteen minutes after it was issued while a bot's edit never does, and a REST call outlives
+ *  the gateway lease the ask is giving up. Best effort, so a cosmetic edit can neither lose a decision
+ *  nor break a cancel. */
 async function stripControls(
   rest: REST,
   channel: string,
@@ -768,19 +731,11 @@ async function stripControls(
   }
 }
 
-/** The controls of one question, keyed by the id an interaction comes back carrying — FIRST wins, and
- *  a repeat is ANNOUNCED.
- *
- *  Two controls sharing an id cannot be told apart on the way back: Discord returns the custom id and
- *  nothing else, so whichever entry this map holds answers for both. Built the obvious way
- *  (`new Map(controls.map(…))`) the LAST one silently wins, which is the worst of the three possible
- *  behaviours — a human presses "deny" and the program is told "approve", with nothing anywhere saying
- *  so. Keeping the first at least makes the outcome match declaration order, and the warning turns a
- *  silent mis-route into something a developer can find in a log.
- *
- *  It cannot be FIXED here — one of the two controls is unroutable whatever this does — which is why
- *  `discord.check_controls` exists: it refuses the same list as a value, purely, where the controls are
- *  built and long before a human is asked to press one. */
+/** The controls of one question, keyed by the id an interaction comes back carrying. Two controls
+ *  sharing an id cannot be told apart on the way back — Discord returns the custom id and nothing else
+ *  — so the first wins (matching declaration order) and the repeat is warned about rather than lost
+ *  silently. It cannot be fixed here; `discord.check_controls` refuses the same list as a value, where
+ *  the controls are built. */
 function controlsById(controls: Control[]): Map<string, Control> {
   const byId = new Map<string, Control>();
   for (const control of controls) {
@@ -912,14 +867,9 @@ katari.agent<{ token: string; channel: string; prompt: string; controls: unknown
           }
           if (!interaction.isButton()) return;
           if (control.kind === "form") {
-            // BUILDING the dialog runs `@discordjs/builders`' validators, and a builder that refuses throws
-            // SYNCHRONOUSLY — so the build must not sit as the argument of `showModal`, where no `.catch` is
-            // attached yet: the throw would leave this router callback, and a throw that escapes an event
-            // handler settles nothing (the click does nothing, the controls stay live, the ask hangs) and on
-            // a sidecar without the port's process guard kills the process, failing every in-flight call as
-            // an uncatchable panic. Built here instead, a refusal is `fail`ed as the typed `api_error` a
-            // broken question is documented to become — including the refusals this package does not
-            // enumerate, a future discord.js check or a component count past a platform limit.
+            // The builders' validators throw synchronously, so the build must not sit as the argument of
+            // `showModal` where no `.catch` is attached yet: a throw escaping this router callback settles
+            // nothing and leaves the ask hanging. Built here, a refusal is `fail`ed as a typed `api_error`.
             let dialog: ModalBuilder;
             try {
               dialog = renderModal(control);
@@ -927,10 +877,8 @@ katari.agent<{ token: string; channel: string; prompt: string; controls: unknown
               fail(error);
               return;
             }
-            // Opening the dialog IS this click's acknowledgement, and it has to land within three seconds
-            // — the router fires as the click arrives, so there is time. A dialog Discord itself refuses
-            // is the platform rejecting the payload: fail the ask as `api_error` rather than leave it
-            // waiting on an answer that this control can no longer deliver.
+            // Opening the dialog is this click's acknowledgement and has to land within three seconds.
+            // A dialog Discord refuses fails the ask as `api_error`.
             void interaction.showModal(dialog).catch(fail);
             return;
           }
@@ -944,25 +892,18 @@ katari.agent<{ token: string; channel: string; prompt: string; controls: unknown
             control.label,
           );
         });
-        // The runtime cancelled the call — a `time.with_deadline` expiry, a `region.cancel_by_id`, a run
-        // teardown. Since `ask` carries no timeout of its own, a deadline around it is the RECOMMENDED
-        // composition, which makes this the ordinary way a question ends: not a failure, so it settles as a
-        // plain cancellation and never as a typed `discord_error` — there is nothing here for the program to
-        // catch. The controls still come off, because a question nobody is waiting on any more must stop
-        // looking answerable.
+        // The runtime cancelled the call (a `time.with_deadline` expiry, a `region.cancel_by_id`, a
+        // teardown). Since a deadline around `ask` is the recommended composition this is an ordinary
+        // ending, so it settles as a plain cancellation and never as a typed `discord_error`.
         context.signal.addEventListener("abort", () => {
           if (settled) return;
           settled = true;
           cleanup();
-          // Launched, not awaited: this listener is synchronous, and a cancel must not wait on a cosmetic
-          // edit (nor break on one — `stripControls` swallows its own failure). The cancel settles now, the
-          // edit lands when Discord answers it, and it rides the token's REST client rather than the
-          // gateway this call is about to release.
+          // Launched, not awaited: this listener is synchronous and a cancel must not wait on a cosmetic
+          // edit. It rides the token's REST client rather than the gateway this call is about to release.
           void stripControls(rest, channel, posted, prompt, "(expired)");
-          // `KatariCancelledError` is the rejection the port expects from a handler unwinding on abort, and
-          // it confirms the cancel QUIETLY. A plain `Error` is confirmed too, but reported as "handler threw
-          // during cancellation" — which, since a deadline around `ask` is the recommended composition,
-          // would print a phantom diagnostic every time a question simply expired.
+          // The rejection the port expects from a handler unwinding on abort; a plain `Error` is reported
+          // as "handler threw during cancellation" instead.
           reject(new KatariCancelledError());
         });
       });
@@ -1002,8 +943,7 @@ katari.agent<{ token: string; channel: string; deliver_to: KatariAgent }>(
         const cleanup = () => gateway.watchers.delete(watcher);
         gateway.watchers.add(watcher);
         // A socket that never opens (a bad token, an unreachable API) fails the watch as the declared
-        // `discord_error`, classified auth vs api exactly as a send is — 0.6.0 raised this from the
-        // provider's login instead, which is why nothing connects there any more.
+        // `discord_error`, classified auth vs api exactly as a send is.
         gateway.ready.catch((error: unknown) => {
           cleanup();
           reject(
