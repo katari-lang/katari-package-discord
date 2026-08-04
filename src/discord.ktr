@@ -70,7 +70,9 @@ external agent discord_history(
 `message` value to a callback. The sidecar opens the gateway socket for this call's lifetime (shared
 with any other live watch or `ask` on the same token, closed when the last of them ends) and attaches
 the listener before the socket comes up, so nothing arriving on a fresh connection is
-delivered to nobody. Raises `discord_error` when the gateway will not open. Prefer the watch_messages agent."
+delivered to nobody. Raises `discord_error` when the gateway will not open. The one connection is the
+whole contract — no replay, no reconnection policy — which is what makes this the form for a caller
+composing its own supervision; `watch_messages` is that composition with the default policy."
 external agent discord_watch[effect E](
   @"The bot token to listen with." token: string of private,
   @"The channel to listen on." channel: string,
@@ -129,22 +131,28 @@ agent try_send(
 
 @"Serve a channel forever, delivering each incoming message to @deliver_to@ as one `message` value;
 shaped like `time.watch` so it composes under `parallel [ … ]`. Bot posts (this bot's own replies
-included) are not delivered, so replying from @deliver_to@ cannot loop. Raises `discord_error` when the
-gateway will not open — opening it is this call's job, so an invalid token stops the watch as
-`auth_error` rather than failing the provider.
+included) are not delivered, so replying from @deliver_to@ cannot loop.
 
-Delivery is exactly once within one live gateway connection and guaranteed neither way across a
-reconnect or a runtime restart: the gateway has no per-event acknowledgement and Discord backfills
-nothing onto a fresh session, so a message can be missed, far more rarely repeated, and nothing here
-dedups. A bot that must miss nothing keeps the `id` of the last message it handled somewhere durable
-and closes the gap with `list_messages`.
+The watch supervises itself: a panic — a runtime restart interrupting the call under the at-most-once
+rule, before anything else — reopens the gateway with a freshly resolved credential, on an exponential
+backoff capped at fifteen minutes. A typed `discord_error` still flies: an invalid token stops the
+watch loudly as `auth_error` rather than retrying into a locked door. The mortal single-connection
+form is `discord_watch`.
+
+Delivery is exactly once within one live gateway connection and guaranteed neither way across the
+reconnect: the gateway has no per-event acknowledgement and Discord backfills nothing onto a fresh
+session, so a message posted while the watch was down is missed, far more rarely repeated, and nothing
+here dedups. A bot that must miss nothing keeps the `id` of the last message it handled somewhere
+durable and closes the gap with `list_messages`.
 
 @author@ is an enumerable snowflake, so pass it through `crypto.pseudonym` before letting it leave the
 program. @display_name@ beside it is self-chosen and not unique: address with it, authorize on @author@."
-agent watch_messages[effect E](
+agent watch_messages[effect E lacks supervise.interrupted](
   @"The channel to serve." channel: string,
   @"Called once per incoming message, with the whole message as one value; its effects E flow to the caller's handlers." deliver_to: agent (value: message) -> null with E,
 ) -> never with E | credential | io | prelude.throw[discord_error] {
+  use supervise.forever()
+  use supervise.signal_panics[never]()
   discord_watch(token = credential(), channel = channel, deliver_to = deliver_to)
 }
 

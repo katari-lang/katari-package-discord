@@ -13,7 +13,10 @@ any AI layer: an app reacts to messages with whatever agent it hands to `watch_m
 - `discord.watch_messages(channel, deliver_to)` — serve a channel forever, delivering each incoming
   message to your agent as one `discord.message(id, channel, author, display_name, text, files)` value.
   Bot posts (this bot's own replies included) are not delivered, so replying cannot loop. Never
-  resolves; composes under `parallel [ … ]`. The callback's own argument is named `value`.
+  resolves; composes under `parallel [ … ]`. The callback's own argument is named `value`. The watch
+  supervises itself — a runtime restart's interruption reopens the gateway on a capped backoff, while
+  `auth_error` still stops it loudly; `discord_watch` is the mortal single-connection form for a caller
+  composing its own policy.
 - `discord.list_messages(channel, after ?= "", limit ?= 50) -> array[message]` — the channel's history
   after a message id, in posted order, as the same `message` value the watch delivers, so one handler
   serves both paths.
@@ -165,4 +168,5 @@ agent echo_bot(channel: string) -> never {
 
 That bot escalates `prelude.throw[discord.discord_error | env.missing_secret | oauth.server_error]` to
 its run root: nothing connects at the provider, so a bad token stops the watch rather than the `use`. A
-resident bot forks the watch into a region instead and re-forks it on `region.crashed`.
+resident bot forks the watch into a region instead; the watch supervises itself, so what reaches the
+region's events is only what no reconnect heals.
